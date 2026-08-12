@@ -1,0 +1,86 @@
+# Security Audit Report
+
+## Critical
+
+### 1. Hardcoded JWT Secret Key
+- **File:** `backend/core/config.py:11`
+- `JWT_SECRET_KEY: str = "change-me-in-production"` - If `.env` doesn't override this, anyone can forge admin tokens.
+- **Fix:** Remove the default, require it via `.env` with a 64-char random string.
+
+### 2. Hardcoded Bootstrap Admin Password
+- **File:** `backend/core/config.py:17`
+- `BOOTSTRAP_ADMIN_PASSWORD: str = "admin123"` - Every deployment starts with this trivial password.
+- **Fix:** Remove default, force password change on first login.
+
+### 3. API Keys in `.env`
+- **File:** `backend/.env:1-2`
+- Real Gemini and OpenAI keys stored in plaintext. If committed to git, they're permanently exposed.
+- **Fix:** Add `.env` to `.gitignore`. Rotate these keys now since they've been seen in this conversation.
+
+### 4. Password Reset Token Leaked in Response
+- **File:** `backend/routers/auth.py:78`
+- `"token": reset_token` is returned to anyone who calls the endpoint — enables account takeover.
+- **Fix:** Remove the token from the response. Deliver it only via email or an admin-only panel.
+
+## High
+
+### 5. No Rate Limiting on Login / Password Reset
+- **File:** `backend/routers/auth.py:20,52`
+- Unlimited login attempts enable brute-force/credential stuffing. Unlimited password resets enable DoS.
+- **Fix:** Use `slowapi` — e.g., `5/minute` on login, `3/15min` on reset per email.
+
+### 6. Duplicate `POST /users/` Route
+- **File:** `backend/routers/users.py` — the endpoint exists twice (lines 45 and ~105). FastAPI uses the last one, which lacks error handling.
+- **Fix:** Remove the duplicate definition.
+
+### 7. ObjectId Injection (No Validation)
+- **Files:** All routers — `user_id`, `student_id`, `class_id` passed directly to `bson.ObjectId()` without validation.
+- **Fix:** Wrap in try/except `bson.errors.InvalidId` and return 400 for malformed IDs.
+
+### 8. JWT Token Lifetime Too Long (24 hours)
+- **File:** `backend/core/config.py:13`
+- `JWT_EXPIRE_MINUTES: int = 1440` — stolen tokens are valid for a full day. No revocation mechanism exists.
+- **Fix:** Reduce to 15-30 min. Add refresh token flow. Check account status on each request.
+
+## Medium
+
+### 9. No Password Strength Validation
+- **File:** `backend/models/auth.py` — passwords are plain `str` with no minimum length or complexity.
+- **Fix:** Add Pydantic validator: min 8 chars, uppercase + digit required.
+
+### 10. No File Upload Size Limit
+- **File:** `backend/routers/users.py:232` — CSV import only checks `.csv` extension, no size limit.
+- **Fix:** Cap at 5MB, validate content type.
+
+### 11. Teachers See ALL Students
+- **File:** `backend/routers/students.py:17-35` — no class-based filtering for teachers.
+- **Fix:** Filter students to only those in classes the teacher is assigned to.
+
+### 12. No Audit Logging
+- User creation, deletion, role changes leave no audit trail.
+- **Fix:** Log critical operations to a separate collection.
+
+### 13. CORS Too Permissive
+- **File:** `backend/main.py:14-15` — `allow_methods=["*"]`, `allow_headers=["*"]`.
+- **Fix:** Restrict to `["GET", "POST", "PATCH", "DELETE"]` and `["Authorization", "Content-Type"]`.
+
+## Low
+
+### 14. `datetime.utcnow()` Deprecated (Python 3.12+)
+- **Fix:** Use `datetime.now(timezone.utc)`.
+
+### 15. Pydantic v2 `.dict()` Deprecated
+- **Fix:** Replace with `.model_dump()`.
+
+### 16. Duplicate `oauth2_scheme` Definition
+- Defined in both `security.py:10` and `deps.py:8`. Keep one, import the other.
+
+---
+
+### Immediate Priority
+1. Rotate exposed API keys
+2. Set strong `JWT_SECRET_KEY` in `.env`
+3. Change bootstrap admin password + force reset on first login
+4. Remove reset token from API response
+5. Delete duplicate `create_user` route
+6. Add rate limiting to login/reset
