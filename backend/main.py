@@ -142,16 +142,17 @@ async def startup_event():
         os.makedirs(dir_path, exist_ok=True)
     print(f"[OK] Storage directories created at: {settings.STORAGE_PATH}")
 
-    # Bootstrap admin user if not exists
+    # Bootstrap admin user if not exists (or update password hash)
     from core.security import get_password_hash
     from datetime import datetime
 
     admin_email = settings.BOOTSTRAP_ADMIN_EMAIL
+    admin_password_hash = get_password_hash(settings.BOOTSTRAP_ADMIN_PASSWORD)
     admin = await users_collection.find_one({"email": admin_email})
     if not admin:
         admin_doc = {
             "email": admin_email,
-            "password_hash": get_password_hash(settings.BOOTSTRAP_ADMIN_PASSWORD),
+            "password_hash": admin_password_hash,
             "full_name": "System Admin",
             "role": "admin",
             "class_id": None,
@@ -164,7 +165,11 @@ async def startup_event():
         await users_collection.insert_one(admin_doc)
         print(f"[OK] Bootstrap admin user created: {admin_email}")
     else:
-        print(f"[OK] Bootstrap admin already exists: {admin_email}")
+        await users_collection.update_one(
+            {"email": admin_email},
+            {"$set": {"password_hash": admin_password_hash}}
+        )
+        print(f"[OK] Bootstrap admin already exists (password updated): {admin_email}")
 
     # Start batch poller (Phase 7)
     from workers.batch_poller import run_poller as run_batch_poller
