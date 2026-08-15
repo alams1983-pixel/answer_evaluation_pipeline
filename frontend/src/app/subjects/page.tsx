@@ -291,7 +291,7 @@ export default function SubjectsPage() {
                 >
                   <option value="">Select class</option>
                   {classes.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}{c.section ? ` - ${cls.section}` : ''}</option>
+                    <option key={c.id} value={c.id}>{c.name}{c.section ? ` - ${c.section}` : ''}</option>
                   ))}
                 </select>
               </div>

@@ -4,6 +4,55 @@ import base64
 from typing import List, Optional
 from core.config import settings
 
+UNIVERSAL_RESULT_SCHEMA = {
+    "type": "object",
+    "required": ["student", "total_max", "total_awarded", "questions"],
+    "properties": {
+        "student": {
+            "type": "object",
+            "required": ["name", "roll_no", "class"],
+            "properties": {
+                "name": {"type": "string", "description": "Student full name"},
+                "roll_no": {"type": "string", "description": "Roll number"},
+                "class": {"type": "string", "description": "Class/section"}
+            }
+        },
+        "subject": {"type": "string", "description": "Subject name"},
+        "exam_title": {"type": "string", "description": "Exam title"},
+        "total_max": {"type": "number", "minimum": 0, "description": "Maximum possible marks"},
+        "total_awarded": {"type": "number", "minimum": 0, "description": "Total marks awarded"},
+        "percentage": {"type": "number", "minimum": 0, "maximum": 100, "description": "Percentage score"},
+        "grade": {"type": "string", "description": "Grade awarded"},
+        "overall_feedback": {"type": "string", "description": "General evaluation feedback for student"},
+        "remedial_topics": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Topics recommended for revision"
+        },
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["q_no", "awarded", "max"],
+                "properties": {
+                    "q_no": {"type": "string", "description": "Question number/identifier"},
+                    "max": {"type": "number", "minimum": 0, "description": "Maximum marks for question"},
+                    "awarded": {"type": "number", "minimum": 0, "description": "Marks awarded"},
+                    "feedback": {"type": "string", "description": "Question-specific feedback"},
+                    "page_refs": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Page numbers where question appears"
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "AI confidence score (0-1)"},
+                    "error_type": {"type": "string", "description": "Error category if any (conceptual, calculation, incomplete)"}
+                }
+            },
+            "description": "Per-question evaluation breakdown"
+        }
+    }
+}
+
 
 def build_jsonl_line_gemini(
     sheet_id: str,
@@ -14,10 +63,12 @@ def build_jsonl_line_gemini(
     page_image_paths: List[str],
     answer_key_questions: List[dict],
     sample_sheets: List[dict],
-    result_schema: dict,
+    result_schema: Optional[dict] = None,
     qp_page_paths: Optional[List[str]] = None,
     complexity_tier: str = "standard",
 ) -> str:
+    target_schema = result_schema if (result_schema and isinstance(result_schema, dict) and len(result_schema) > 0) else UNIVERSAL_RESULT_SCHEMA
+
     parts = []
 
     tier_instructions = {
@@ -98,7 +149,7 @@ def build_jsonl_line_gemini(
             parts.append({"_file_ref": img_path})
 
     parts.append({
-        "text": f"Respond with JSON ONLY conforming to schema: {json.dumps(result_schema)}"
+        "text": f"Respond with JSON ONLY conforming to schema: {json.dumps(target_schema)}"
     })
 
     contents = [
@@ -112,6 +163,7 @@ def build_jsonl_line_gemini(
     }
 
     line = {
+        "custom_id": f"sheet_{sheet_id}",
         "key": f"sheet_{sheet_id}",
         "request": request,
     }
@@ -128,10 +180,12 @@ def build_jsonl_line_openai(
     page_image_paths: List[str],
     answer_key_questions: List[dict],
     sample_sheets: List[dict],
-    result_schema: dict,
+    result_schema: Optional[dict] = None,
     model: str = "gpt-4.1-mini",
 ) -> str:
+    target_schema = result_schema if (result_schema and isinstance(result_schema, dict) and len(result_schema) > 0) else UNIVERSAL_RESULT_SCHEMA
     content_parts = []
+
 
     content_parts.append({
         "type": "text",
@@ -246,7 +300,7 @@ def build_jsonl_line_openai(
                 }
             })
 
-    schema_prompt = f"Respond with JSON ONLY conforming to schema: {json.dumps(result_schema)}"
+    schema_prompt = f"Respond with JSON ONLY conforming to schema: {json.dumps(target_schema)}"
     content_parts.append({
         "type": "text",
         "text": schema_prompt
@@ -266,10 +320,11 @@ def build_jsonl_line_openai(
             "type": "json_schema",
             "json_schema": {
                 "name": "grading_result",
-                "schema": result_schema,
+                "schema": target_schema,
             },
         },
     }
+
 
     line = {
         "custom_id": f"sheet_{sheet_id}",

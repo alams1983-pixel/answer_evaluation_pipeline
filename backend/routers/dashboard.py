@@ -1,13 +1,10 @@
 from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 from models.auth import UserResponse
 from core.deps import get_current_user
-from db.database import (
-    exams_collection,
-    answer_sheets_collection,
-    batch_jobs_collection,
-    gradings_collection,
-    users_collection,
-)
+from db.database import get_db
+from db.models import Exam, User, AnswerSheet, BatchJob, Grading
 
 router = APIRouter(
     prefix="/dashboard",
@@ -17,34 +14,37 @@ router = APIRouter(
 
 @router.get("/stats/")
 async def get_dashboard_stats(
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     stats = {}
 
     if current_user.role in ("admin", "teacher"):
-        stats["total_exams"] = await exams_collection.count_documents({})
-        stats["total_students"] = await users_collection.count_documents({"role": "student"})
+        r_exams = await db.execute(select(func.count(Exam.id)))
+        stats["total_exams"] = r_exams.scalar() or 0
 
-        pending_filter = {"status": "pending"}
-        graded_filter = {"status": {"$in": ["graded", "reviewed", "published"]}}
+        r_students = await db.execute(select(func.count(User.id)).where(User.role == "student"))
+        stats["total_students"] = r_students.scalar() or 0
 
-        stats["pending_sheets"] = await answer_sheets_collection.count_documents(pending_filter)
-        stats["graded_sheets"] = await answer_sheets_collection.count_documents(graded_filter)
+        r_pending = await db.execute(select(func.count(AnswerSheet.id)).where(AnswerSheet.status == "pending"))
+        stats["pending_sheets"] = r_pending.scalar() or 0
 
-        active_filter = {"status": {"$in": ["pending", "processing", "submitting"]}}
-        stats["active_batches"] = await batch_jobs_collection.count_documents(active_filter)
+        r_graded = await db.execute(select(func.count(AnswerSheet.id)).where(AnswerSheet.status.in_(["graded", "reviewed", "published"])))
+        stats["graded_sheets"] = r_graded.scalar() or 0
 
-        stats["total_gradings"] = await gradings_collection.count_documents({})
+        r_batches = await db.execute(select(func.count(BatchJob.id)).where(BatchJob.status.in_(["pending", "processing", "submitting", "submitted", "in_progress"])))
+        stats["active_batches"] = r_batches.scalar() or 0
+
+        r_gradings = await db.execute(select(func.count(Grading.id)))
+        stats["total_gradings"] = r_gradings.scalar() or 0
     else:
-        student_gradings = {"student_id": current_user.id}
-        stats["total_exams"] = await gradings_collection.count_documents(student_gradings)
-        stats["pending_results"] = await gradings_collection.count_documents({
-            **student_gradings,
-            "status": {"$in": ["pending", "processing"]},
-        })
-        stats["published_results"] = await gradings_collection.count_documents({
-            **student_gradings,
-            "status": "published",
-        })
+        r_exams = await db.execute(select(func.count(Grading.id)).where(Grading.student_id == current_user.id))
+        stats["total_exams"] = r_exams.scalar() or 0
+
+        r_pending_res = await db.execute(select(func.count(Grading.id)).where(Grading.student_id == current_user.id, Grading.status.in_(["pending", "processing"])))
+        stats["pending_results"] = r_pending_res.scalar() or 0
+
+        r_pub_res = await db.execute(select(func.count(Grading.id)).where(Grading.student_id == current_user.id, Grading.status == "published"))
+        stats["published_results"] = r_pub_res.scalar() or 0
 
     return stats

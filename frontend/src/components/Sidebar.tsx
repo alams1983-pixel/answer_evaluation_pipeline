@@ -34,9 +34,9 @@ const sections = [
     label: 'Assessments',
     items: [
       { href: '/exams', label: 'Exams', roles: ['admin', 'teacher'], icon: IconExams },
-      { href: '/result-schemas', label: 'Result Schemas', roles: ['admin', 'teacher'], icon: IconSchemas },
     ],
   },
+
   {
     label: 'Account',
     items: [

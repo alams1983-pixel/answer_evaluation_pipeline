@@ -122,16 +122,19 @@ export default function ExamDetailPage() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const [examData, classesData, subjectsData, keyData, samplesData, schemaData, allSchemasData] = await Promise.all([
-        apiGet<Exam>(`/exams/${examId}/`),
-        apiGet<Class[]>('/classes/'),
-        apiGet<Subject[]>('/subjects/'),
-        apiGet<{ id: string; questions: Question[]; sample_sheets: SampleSheet[] } | null>(`/exams/${examId}/answer-key/`),
-        apiGet<SampleSheet[]>(`/exams/${examId}/sample-sheets/`),
-        apiGet<ResultSchema | null>(`/exams/${examId}/result-schema/`),
-        apiGet<ResultSchema[]>('/exams/result-schemas/'),
-      ]);
+      setError(null);
+      const examData = await apiGet<Exam>(`/exams/${examId}/`);
       setExam(examData);
+
+      const [classesData, subjectsData, keyData, samplesData, schemaData, allSchemasData] = await Promise.all([
+        apiGet<Class[]>('/classes/').catch(() => []),
+        apiGet<Subject[]>('/subjects/').catch(() => []),
+        apiGet<{ id: string; questions: Question[]; sample_sheets: SampleSheet[] } | null>(`/exams/${examId}/answer-key/`).catch(() => null),
+        apiGet<SampleSheet[]>(`/exams/${examId}/sample-sheets/`).catch(() => []),
+        apiGet<ResultSchema | null>(`/exams/${examId}/result-schema/`).catch(() => null),
+        apiGet<ResultSchema[]>('/exams/result-schemas/').catch(() => []),
+      ]);
+
       setClasses(classesData);
       setSubjects(subjectsData);
       setAnswerKey(keyData);
@@ -147,10 +150,14 @@ export default function ExamDetailPage() {
         setUseBuilder(true);
       }
 
-      const pending = await getSheetsForExam(examId, 'pending_mapping');
-      setPendingSheetsCount(pending.length);
+      try {
+        const pending = await getSheetsForExam(examId, 'pending_mapping');
+        setPendingSheetsCount(pending.length);
+      } catch {
+        setPendingSheetsCount(0);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load data');
+      setError(err instanceof Error ? err.message : 'Failed to load exam data');
     } finally {
       setLoading(false);
     }
@@ -266,40 +273,49 @@ export default function ExamDetailPage() {
   };
 
   const handleSaveResultSchema = async () => {
+    const finalSchemaName = schemaName.trim() || `${exam?.title || 'Exam'} Result Schema`;
     if (builderFields.length === 0) {
       setError('Add at least one field in the schema builder');
       return;
     }
+    setSavingSchema(true);
+    setError(null);
+    setSuccess(null);
     try {
       const schemaDef = fieldsToJsonSchema(builderFields);
       if (selectedSchemaId && resultSchema) {
         await apiPatch(`/exams/result-schemas/${selectedSchemaId}/`, {
-          name: schemaName,
+          name: finalSchemaName,
           description: schemaDescription || undefined,
           schema_definition: schemaDef,
         });
+        setSuccess('Result schema updated successfully');
       } else {
         const newSchema = await apiPost<ResultSchema>(`/exams/${examId}/result-schema/`, {
-          name: schemaName,
+          name: finalSchemaName,
           description: schemaDescription || undefined,
           schema_definition: schemaDef,
         });
         setSelectedSchemaId(newSchema.id);
+        setSuccess('Result schema created and linked to exam successfully');
       }
-      setError(null);
-      loadData();
+      await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save schema');
+    } finally {
+      setSavingSchema(false);
     }
   };
 
   const handleLinkExistingSchema = async () => {
     if (!selectedSchemaId) return;
     setLinkingSchema(true);
+    setError(null);
+    setSuccess(null);
     try {
       await apiPatch(`/exams/${examId}/`, { result_schema_id: selectedSchemaId });
-      setError(null);
-      loadData();
+      setSuccess('Result schema linked to exam successfully');
+      await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to link schema');
     } finally {
@@ -328,11 +344,11 @@ export default function ExamDetailPage() {
     { key: 'answer-key', label: 'Answer Key' },
     { key: 'samples', label: 'Sample Sheets' },
     { key: 'students', label: 'Enrolled Students' },
-    { key: 'result-schema', label: 'Result Schema' },
     { key: 'upload-sheets', label: pendingSheetsCount > 0 ? `Upload Sheets (${pendingSheetsCount})` : 'Upload Sheets' },
     { key: 'batches', label: 'Batches' },
     { key: 'results', label: 'Results' },
   ];
+
 
   return (
     <div>
@@ -474,9 +490,10 @@ export default function ExamDetailPage() {
         </div>
       )}
 
-      {activeTab === 'question-paper' && (
+      <div style={{ display: activeTab === 'question-paper' ? 'block' : 'none' }}>
         <QuestionPaperTab examId={examId} totalMarks={exam.total_marks} />
-      )}
+      </div>
+
 
       {activeTab === 'answer-key' && (
         <div>
@@ -697,7 +714,7 @@ export default function ExamDetailPage() {
                 <SchemaBuilder initialFields={builderFields} onChange={setBuilderFields} />
               </div>
 
-              <button className="btn btn-primary" onClick={handleSaveResultSchema} disabled={savingSchema || !schemaName || builderFields.length === 0}>
+              <button className="btn btn-primary" onClick={handleSaveResultSchema} disabled={savingSchema || builderFields.length === 0}>
                 {savingSchema ? 'Saving...' : resultSchema ? 'Update & Link Schema' : 'Create & Link Schema'}
               </button>
             </div>

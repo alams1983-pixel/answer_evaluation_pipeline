@@ -1,26 +1,22 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import Optional, List
-import bson
 import os
 
 from models.auth import UserResponse
 from models.sheets import (
     QuestionPaperResponse, ExtractionTaskResponse,
     ExtractedQuestionItem, QuestionPaperPageItem,
-    QuestionPaperCropResponse, CropBBox, CropCreateRequest,
-    AdditionalPdfResponse,
+    CropBBox, CropCreateRequest, AdditionalPdfResponse,
 )
 from core.deps import get_current_user, require_roles
-from db.database import (
-    exams_collection, question_papers_collection, extraction_tasks_collection,
-    answer_keys_collection, classes_collection, question_paper_crops_collection,
-    additional_pdfs_collection,
-)
+from db.database import get_db
+from db.models import Exam, Class, ExtractionTask, QuestionPaper
 from core.config import settings
 from services.question_extraction_service import (
     start_extraction,
-    get_extraction_status,
     get_question_paper,
     update_question_paper_review,
 )
@@ -32,16 +28,16 @@ router = APIRouter(
 )
 
 
-async def _verify_exam_access(exam_id: str, current_user: UserResponse):
-    """Helper to verify exam exists and user has access."""
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
+async def _verify_exam_access(exam_id: str, current_user: UserResponse, db: AsyncSession):
+    res = await db.execute(select(Exam).where(Exam.id == exam_id))
+    exam = res.scalar_one_or_none()
     if not exam:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
 
-    # Only teachers need class ownership check; admins always have access
     if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
+        cls_res = await db.execute(select(Class).where(Class.id == exam.class_id))
+        cls = cls_res.scalar_one_or_none()
+        if not cls:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
     return exam
@@ -52,8 +48,9 @@ async def upload_question_paper(
     exam_id: str,
     file: UploadFile = File(...),
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    exam = await _verify_exam_access(exam_id, current_user, db)
 
     storage_dir = os.path.join(settings.STORAGE_PATH, "question_papers", exam_id)
     os.makedirs(storage_dir, exist_ok=True)
@@ -63,9 +60,7 @@ async def upload_question_paper(
         content = await file.read()
         f.write(content)
 
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    total_marks = exam.get("total_marks", 100)
-
+    total_marks = exam.total_marks or 100
     task_id = await start_extraction(exam_id, file_path, total_marks)
 
     return {
@@ -79,8 +74,9 @@ async def upload_question_paper(
 async def get_exam_question_paper(
     exam_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     qp = await get_question_paper(exam_id)
     if not qp:
@@ -110,7 +106,7 @@ async def get_exam_question_paper(
         status=qp["status"],
         extraction_model=qp.get("extraction_model"),
         created_at=qp["created_at"],
-        updated_at=qp["updated_at"],
+        updated_at=qp.get("updated_at"),
     )
 
 
@@ -118,25 +114,27 @@ async def get_exam_question_paper(
 async def get_extraction_status_endpoint(
     exam_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
-    task = await extraction_tasks_collection.find_one({"exam_id": exam_id})
+    res = await db.execute(select(ExtractionTask).where(ExtractionTask.exam_id == exam_id))
+    task = res.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No extraction task found")
 
     return {
-        "id": str(task["_id"]),
-        "exam_id": task["exam_id"],
-        "status": task.get("status", "pending"),
-        "total_pages": task.get("total_pages", 0),
-        "processed_pages": task.get("processed_pages", 0),
-        "current_page": task.get("current_page", 0),
-        "current_step": task.get("current_step", ""),
-        "questions_found_so_far": task.get("questions_found_so_far", 0),
-        "error": task.get("error"),
-        "started_at": task.get("started_at"),
-        "completed_at": task.get("completed_at"),
+        "id": str(task.id),
+        "exam_id": task.exam_id,
+        "status": task.status or "pending",
+        "total_pages": task.total_pages or 0,
+        "processed_pages": task.processed_pages or 0,
+        "current_page": task.current_page or 0,
+        "current_step": task.current_step or "",
+        "questions_found_so_far": task.questions_found_so_far or 0,
+        "error": task.error,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
     }
 
 
@@ -145,8 +143,9 @@ async def create_crop(
     exam_id: str,
     crop_data: CropCreateRequest,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     crop_id = await crop_service.save_crop(
         exam_id=exam_id,
@@ -173,8 +172,9 @@ async def delete_crop(
     exam_id: str,
     crop_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     success = await crop_service.delete_crop(crop_id)
     if not success:
@@ -188,8 +188,9 @@ async def get_crops(
     exam_id: str,
     question_index: Optional[int] = None,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     if question_index is not None:
         crops = await crop_service.get_crops_for_question(exam_id, question_index)
@@ -206,8 +207,9 @@ async def upload_additional_pdf(
     label: str = Form(...),
     pdf_type: str = Form("reference"),
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     if pdf_type not in ("instructions", "answer_key", "reference"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid PDF type")
@@ -218,7 +220,6 @@ async def upload_additional_pdf(
         label=label,
         pdf_type=pdf_type,
     )
-
     return result
 
 
@@ -226,8 +227,9 @@ async def upload_additional_pdf(
 async def list_additional_pdfs(
     exam_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     pdfs = await additional_pdf_service.list_additional_pdfs(exam_id)
     return {"pdfs": pdfs}
@@ -238,8 +240,9 @@ async def delete_additional_pdf(
     exam_id: str,
     pdf_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     success = await additional_pdf_service.delete_additional_pdf(pdf_id)
     if not success:
@@ -259,8 +262,9 @@ async def review_question_paper(
     exam_id: str,
     review_data: QuestionPaperReviewRequest,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    await _verify_exam_access(exam_id, current_user)
+    await _verify_exam_access(exam_id, current_user, db)
 
     success = await update_question_paper_review(
         exam_id,

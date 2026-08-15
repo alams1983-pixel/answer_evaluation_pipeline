@@ -450,20 +450,8 @@ export default function ExamsPage() {
                   placeholder="Freeform hints for AI grading..."
                 />
               </div>
-              <div className="form-group">
-                <label className="form-label">Result Schema (optional)</label>
-                <select
-                  className="form-input"
-                  value={formData.result_schema_id}
-                  onChange={(e) => setFormData({ ...formData, result_schema_id: e.target.value })}
-                >
-                  <option value="">None (use default)</option>
-                  {schemas.map((s) => (
-                    <option key={s.id} value={s.id}>{s.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end' }}>
+              <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end', marginTop: '1rem' }}>
+
                 <button type="button" className="btn btn-secondary" onClick={() => { setShowModal(false); setSelectedSession(''); setFormData(prev => ({ ...prev, class_id: '', subject_id: '' })); }}>
                   Cancel
                 </button>
@@ -471,6 +459,7 @@ export default function ExamsPage() {
                   {submitting ? 'Creating...' : 'Create'}
                 </button>
               </div>
+
             </form>
           </div>
         </div>

@@ -123,6 +123,8 @@ class GeminiBatchAdapter:
             if not line:
                 continue
             entry = json.loads(line)
+            if "custom_id" not in entry and "key" in entry:
+                entry["custom_id"] = entry["key"]
             request = entry.get("request", {})
             contents = request.get("contents", [])
             for content in contents:

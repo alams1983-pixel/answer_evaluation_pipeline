@@ -352,66 +352,127 @@ export default function SplitScreenReview({
           </div>
 
           {/* Pending crop popup — floating overlay */}
+          {/* Pending crop popup — floating overlay */}
           {pendingCrop && (
-            <div style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: 'rgba(0,0,0,0.6)',
-              zIndex: 100,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-            onClick={() => setPendingCrop(null)}
+            <div
+              style={{
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                background: 'rgba(0, 0, 0, 0.65)',
+                backdropFilter: 'blur(8px)',
+                WebkitBackdropFilter: 'blur(8px)',
+                zIndex: 999999,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '1.5rem',
+              }}
+              onClick={() => setPendingCrop(null)}
             >
               <div
                 style={{
-                  background: 'var(--surface)',
-                  border: '2px solid var(--accent)',
-                  borderRadius: 'var(--radius)',
-                  padding: '1.5rem',
-                  maxWidth: '500px',
-                  width: '90%',
-                  boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                  background: 'var(--bg-secondary)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 'var(--radius-xl)',
+                  padding: '1.75rem',
+                  maxWidth: '520px',
+                  width: '100%',
+                  boxShadow: 'var(--shadow-xl)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '1.25rem',
                 }}
                 onClick={(e) => e.stopPropagation()}
               >
-                <h3 style={{ marginBottom: '1rem', fontSize: '1rem', color: 'var(--accent)' }}>
-                  Crop Preview
-                </h3>
+                {/* Header */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <h3 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+                    Crop Region Preview
+                  </h3>
+                  <button
+                    onClick={() => setPendingCrop(null)}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      fontSize: '1.25rem',
+                      cursor: 'pointer',
+                      color: 'var(--text-secondary)',
+                      lineHeight: 1,
+                    }}
+                    aria-label="Close"
+                  >
+                    ✕
+                  </button>
+                </div>
 
-                <div style={{ textAlign: 'center', marginBottom: '1rem' }}>
+                {/* Preview Image Container */}
+                <div
+                  style={{
+                    textAlign: 'center',
+                    background: 'var(--bg-tertiary)',
+                    padding: '1rem',
+                    borderRadius: 'var(--radius-lg)',
+                    border: '1px solid var(--border-subtle)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
                   <img
                     src={pendingCrop.previewUrl}
                     alt="Crop preview"
                     style={{
                       maxWidth: '100%',
-                      maxHeight: '300px',
+                      maxHeight: '260px',
                       objectFit: 'contain',
-                      borderRadius: '4px',
-                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-sm)',
+                      border: '1px solid var(--border-subtle)',
+                      boxShadow: 'var(--shadow-sm)',
+                      background: '#ffffff',
                     }}
                   />
-                  <p style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--muted)' }}>
-                    {Math.round(pendingCrop.rect.width)} × {Math.round(pendingCrop.rect.height)} pixels
-                  </p>
+                  <span style={{ marginTop: '0.6rem', fontSize: '0.8rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                    Captured Region: {Math.round(pendingCrop.rect.width)} × {Math.round(pendingCrop.rect.height)} px
+                  </span>
                 </div>
 
-                <p style={{ marginBottom: '1rem', fontSize: '0.9rem' }}>
-                  {activeQuestionIndex !== null
-                    ? `Attach this image to question Q${editingQuestions[activeQuestionIndex].q_no}?`
-                    : 'No question selected. Select a question from the right panel to attach.'
-                  }
-                </p>
+                {/* Question Info Banner */}
+                <div
+                  style={{
+                    padding: '0.75rem 1rem',
+                    borderRadius: 'var(--radius-md)',
+                    background: activeQuestionIndex !== null ? 'var(--accent-muted)' : 'var(--warning-bg)',
+                    border: `1px solid ${activeQuestionIndex !== null ? 'var(--accent-primary)' : 'var(--warning)'}`,
+                    fontSize: '0.9rem',
+                    color: activeQuestionIndex !== null ? 'var(--accent-primary)' : 'var(--warning-text)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>
+                    {activeQuestionIndex !== null
+                      ? `Target Question: Q${editingQuestions[activeQuestionIndex].q_no}`
+                      : '⚠️ No Question Selected'}
+                  </span>
+                  <span style={{ fontSize: '0.85rem', opacity: 0.85 }}>
+                    {activeQuestionIndex !== null
+                      ? `(${editingQuestions[activeQuestionIndex].marks} marks)`
+                      : 'Select question on right panel'}
+                  </span>
+                </div>
 
-                <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
+                {/* Buttons */}
+                <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end', paddingTop: '0.25rem' }}>
                   <button
                     className="btn btn-secondary"
                     onClick={() => setPendingCrop(null)}
-                    style={{ padding: '0.5rem 1.2rem' }}
+                    style={{ padding: '0.6rem 1.4rem', fontWeight: 600 }}
                   >
                     Cancel
                   </button>
@@ -419,7 +480,7 @@ export default function SplitScreenReview({
                     className="btn btn-primary"
                     disabled={activeQuestionIndex === null}
                     onClick={handleAttachCrop}
-                    style={{ padding: '0.5rem 1.2rem' }}
+                    style={{ padding: '0.6rem 1.4rem', fontWeight: 600 }}
                   >
                     Attach to Q{activeQuestionIndex !== null ? editingQuestions[activeQuestionIndex].q_no : '?'}
                   </button>

@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, delete, func
 from typing import List, Optional
 from datetime import datetime
-import bson
 import os
 import uuid
 import asyncio
@@ -13,10 +14,9 @@ from models.sheets import (
     AutoMatchRequest,
 )
 from core.deps import get_current_user, require_roles
-from db.database import (
-    exams_collection, answer_sheets_collection, sheet_pages_collection,
-    upload_batches_collection, subjects_collection, classes_collection,
-    exam_students_collection,
+from db.database import get_db, AsyncSessionLocal
+from db.models import (
+    Exam, AnswerSheet, SheetPage, UploadBatch, Class, Subject, ExamStudent
 )
 from core.config import settings
 from services.pdf_service import rasterize_pdf_to_pngs
@@ -34,15 +34,12 @@ async def upload_zip_sheets(
     exam_id: str,
     file: UploadFile = File(...),
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
+    res = await db.execute(select(Exam).where(Exam.id == exam_id))
+    exam = res.scalar_one_or_none()
     if not exam:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
     temp_dir = os.path.join(settings.STORAGE_PATH, "temp_uploads", exam_id, uuid.uuid4().hex)
     os.makedirs(temp_dir, exist_ok=True)
@@ -52,103 +49,118 @@ async def upload_zip_sheets(
         content = await file.read()
         f.write(content)
 
-    upload_batch_doc = {
-        "exam_id": bson.ObjectId(exam_id),
-        "uploaded_by": bson.ObjectId(current_user.id),
-        "zip_filename": file.filename or "upload.zip",
-        "total_pdfs": 0,
-        "processed_pdfs": 0,
-        "status": "extracting",
-        "created_at": datetime.utcnow(),
-    }
-    batch_result = await upload_batches_collection.insert_one(upload_batch_doc)
-    upload_batch_id = str(batch_result.inserted_id)
+    upload_batch_obj = UploadBatch(
+        exam_id=exam_id,
+        uploaded_by=current_user.id,
+        zip_filename=file.filename or "upload.zip",
+        total_pdfs=0,
+        processed_pdfs=0,
+        status="extracting",
+        created_at=datetime.utcnow(),
+    )
+    db.add(upload_batch_obj)
+    await db.commit()
+    await db.refresh(upload_batch_obj)
+    upload_batch_id = str(upload_batch_obj.id)
 
     async def process_zip_background():
         try:
-            print(f"[DEBUG] Starting background processing for batch {upload_batch_id}")
-            print(f"[DEBUG] Storage path: {settings.STORAGE_PATH}")
-
             extract_dir = os.path.join(temp_dir, "extracted")
             pdf_paths = extract_pdf_files_from_zip(zip_path, extract_dir)
-            print(f"[DEBUG] Extracted {len(pdf_paths)} PDFs from zip")
 
-            await upload_batches_collection.update_one(
-                {"_id": batch_result.inserted_id},
-                {"$set": {"total_pdfs": len(pdf_paths)}}
-            )
+            async with AsyncSessionLocal() as session:
+                b_res = await session.execute(select(UploadBatch).where(UploadBatch.id == upload_batch_id))
+                b_obj = b_res.scalar_one_or_none()
+                if b_obj:
+                    b_obj.total_pdfs = len(pdf_paths)
+                    await session.commit()
 
             for idx, pdf_path in enumerate(pdf_paths):
                 parsed = parse_pdf_filename(os.path.basename(pdf_path))
-
                 pdf_storage_dir = os.path.join(settings.STORAGE_PATH, "original_pdfs")
                 os.makedirs(pdf_storage_dir, exist_ok=True)
 
-                sheet_id = bson.ObjectId()
-                pdf_dest = os.path.join(pdf_storage_dir, f"{sheet_id}.pdf")
+                sheet_uuid = uuid.uuid4().hex
+                pdf_dest = os.path.join(pdf_storage_dir, f"{sheet_uuid}.pdf")
                 os.rename(pdf_path, pdf_dest)
 
-                pages_dir = os.path.join(settings.STORAGE_PATH, "answer_sheets", str(sheet_id))
-                print(f"[DEBUG] Rasterizing PDF {idx+1}/{len(pdf_paths)}: {pdf_dest} -> {pages_dir}")
+                pages_dir = os.path.join(settings.STORAGE_PATH, "answer_sheets", sheet_uuid)
                 page_infos = rasterize_pdf_to_pngs(pdf_dest, pages_dir, dpi=150)
-                print(f"[DEBUG] Generated {len(page_infos)} pages: {[pi['image_path'] for pi in page_infos]}")
 
-                sheet_doc = {
-                    "_id": sheet_id,
-                    "exam_id": bson.ObjectId(exam_id),
-                    "subject_id": exam.get("subject_id"),
-                    "student_id": None,
-                    "student_name": parsed.student_name,
-                    "roll_no": parsed.roll_no,
-                    "class_label": parsed.class_label,
-                    "original_filename": parsed.original_filename,
-                    "original_pdf_path": pdf_dest,
-                    "page_count": len(page_infos),
-                    "status": "pending_mapping",
-                    "current_batch_id": None,
-                    "uploaded_by": bson.ObjectId(current_user.id),
-                    "batch_upload_id": batch_result.inserted_id,
-                    "created_at": datetime.utcnow(),
-                    "updated_at": None,
-                }
-                await answer_sheets_collection.insert_one(sheet_doc)
+                async with AsyncSessionLocal() as session:
+                    sheet_obj = AnswerSheet(
+                        id=sheet_uuid,
+                        exam_id=exam_id,
+                        subject_id=exam.subject_id,
+                        student_id=None,
+                        student_name=parsed.student_name,
+                        roll_no=parsed.roll_no,
+                        class_label=parsed.class_label,
+                        original_filename=parsed.original_filename,
+                        original_pdf_path=pdf_dest,
+                        page_count=len(page_infos),
+                        status="pending_mapping",
+                        current_batch_id=None,
+                        uploaded_by=current_user.id,
+                        batch_upload_id=upload_batch_id,
+                        created_at=datetime.utcnow(),
+                    )
+                    session.add(sheet_obj)
+                    await session.commit()
 
-                for pi in page_infos:
-                    page_doc = {
-                        "sheet_id": sheet_id,
-                        "page_no": pi["page_no"],
-                        "image_path": pi["image_path"],
-                        "width": pi["width"],
-                        "height": pi["height"],
-                        "is_deleted": False,
-                        "created_at": datetime.utcnow(),
-                    }
-                    await sheet_pages_collection.insert_one(page_doc)
+                    for pi in page_infos:
+                        page_obj = SheetPage(
+                            sheet_id=sheet_uuid,
+                            page_no=pi["page_no"],
+                            image_path=pi["image_path"],
+                            width=pi["width"],
+                            height=pi["height"],
+                            is_deleted=False,
+                            created_at=datetime.utcnow(),
+                        )
+                        session.add(page_obj)
 
-                processed_count = idx + 1
-                await upload_batches_collection.update_one(
-                    {"_id": batch_result.inserted_id},
-                    {"$set": {"processed_pdfs": processed_count}}
-                )
+                    b_res = await session.execute(select(UploadBatch).where(UploadBatch.id == upload_batch_id))
+                    b_obj = b_res.scalar_one_or_none()
+                    if b_obj:
+                        b_obj.processed_pdfs = idx + 1
+                    await session.commit()
 
-            await upload_batches_collection.update_one(
-                {"_id": batch_result.inserted_id},
-                {"$set": {"status": "ready_for_mapping"}}
-            )
+            async with AsyncSessionLocal() as session:
+                b_res = await session.execute(select(UploadBatch).where(UploadBatch.id == upload_batch_id))
+                b_obj = b_res.scalar_one_or_none()
+                if b_obj:
+                    b_obj.status = "ready_for_mapping"
+                    await session.commit()
+
+            # Automatically run auto-matching for high confidence student matches
+            try:
+                from services.auto_match_service import find_student_matches, apply_student_matches
+                suggestions = await find_student_matches(exam_id)
+                auto_matches = [
+                    {"sheet_id": s["sheet_id"], "student_id": s["suggested_student_id"]}
+                    for s in suggestions
+                    if s.get("confidence") == "high" and s.get("suggested_student_id")
+                ]
+                if auto_matches:
+                    await apply_student_matches(exam_id, auto_matches)
+            except Exception as match_err:
+                print(f"[ZIP Upload] Auto-match background exception: {match_err}")
 
             if os.path.exists(extract_dir):
                 cleanup_extract_dir(extract_dir)
             if os.path.exists(zip_path):
                 os.remove(zip_path)
 
+
         except Exception as e:
-            import traceback
-            error_trace = traceback.format_exc()
-            print(f"[ERROR] Background processing failed: {error_trace}")
-            await upload_batches_collection.update_one(
-                {"_id": batch_result.inserted_id},
-                {"$set": {"status": "failed", "error": str(e)}}
-            )
+            print(f"[ERROR] Background processing failed: {e}")
+            async with AsyncSessionLocal() as session:
+                b_res = await session.execute(select(UploadBatch).where(UploadBatch.id == upload_batch_id))
+                b_obj = b_res.scalar_one_or_none()
+                if b_obj:
+                    b_obj.status = "failed"
+                    await session.commit()
 
     asyncio.create_task(process_zip_background())
 
@@ -160,7 +172,7 @@ async def upload_zip_sheets(
         total_pdfs=0,
         processed_pdfs=0,
         status="extracting",
-        created_at=upload_batch_doc["created_at"],
+        created_at=upload_batch_obj.created_at,
     )
 
 
@@ -169,39 +181,33 @@ async def list_sheets(
     exam_id: str,
     status_filter: Optional[str] = None,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    query = {"exam_id": bson.ObjectId(exam_id)}
+    query = select(AnswerSheet).where(AnswerSheet.exam_id == exam_id)
     if status_filter:
-        query["status"] = status_filter
+        query = query.where(AnswerSheet.status == status_filter)
 
-    sheets = await answer_sheets_collection.find(query).sort("created_at", 1).to_list(length=None)
+    res = await db.execute(query.order_by(AnswerSheet.created_at.asc()))
+    sheets = res.scalars().all()
+
     return [
         AnswerSheetResponse(
-            id=str(s["_id"]),
+            id=str(s.id),
             exam_id=exam_id,
-            subject_id=str(s["subject_id"]) if s.get("subject_id") else None,
-            student_name=s.get("student_name"),
-            roll_no=s.get("roll_no"),
-            class_label=s.get("class_label"),
-            original_filename=s["original_filename"],
-            student_id=str(s["student_id"]) if s.get("student_id") else None,
-            original_pdf_path=s.get("original_pdf_path"),
-            page_count=s.get("page_count", 0),
-            status=s.get("status", "pending_mapping"),
-            current_batch_id=str(s["current_batch_id"]) if s.get("current_batch_id") else None,
-            uploaded_by=str(s["uploaded_by"]) if s.get("uploaded_by") else None,
-            batch_upload_id=str(s["batch_upload_id"]) if s.get("batch_upload_id") else None,
-            created_at=s["created_at"],
-            updated_at=s.get("updated_at"),
+            subject_id=str(s.subject_id) if s.subject_id else None,
+            student_name=s.student_name,
+            roll_no=s.roll_no,
+            class_label=s.class_label,
+            original_filename=s.original_filename,
+            student_id=str(s.student_id) if s.student_id else None,
+            original_pdf_path=s.original_pdf_path,
+            page_count=s.page_count or 0,
+            status=s.status or "pending_mapping",
+            current_batch_id=str(s.current_batch_id) if s.current_batch_id else None,
+            uploaded_by=str(s.uploaded_by) if s.uploaded_by else None,
+            batch_upload_id=str(s.batch_upload_id) if s.batch_upload_id else None,
+            created_at=s.created_at,
+            updated_at=s.updated_at,
         )
         for s in sheets
     ]
@@ -211,25 +217,25 @@ async def list_sheets(
 async def list_upload_batches(
     exam_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    batches = await upload_batches_collection.find(
-        {"exam_id": bson.ObjectId(exam_id)}
-    ).sort("created_at", -1).to_list(length=None)
+    res = await db.execute(
+        select(UploadBatch)
+        .where(UploadBatch.exam_id == exam_id)
+        .order_by(UploadBatch.created_at.desc())
+    )
+    batches = res.scalars().all()
 
     return [
         UploadBatchResponse(
-            id=str(b["_id"]),
+            id=str(b.id),
             exam_id=exam_id,
-            uploaded_by=str(b["uploaded_by"]) if b.get("uploaded_by") else None,
-            zip_filename=b["zip_filename"],
-            total_pdfs=b.get("total_pdfs", 0),
-            processed_pdfs=b.get("processed_pdfs", 0),
-            status=b.get("status", "extracting"),
-            created_at=b["created_at"],
+            uploaded_by=str(b.uploaded_by) if b.uploaded_by else None,
+            zip_filename=b.zip_filename,
+            total_pdfs=b.total_pdfs or 0,
+            processed_pdfs=b.processed_pdfs or 0,
+            status=b.status or "extracting",
+            created_at=b.created_at,
         )
         for b in batches
     ]
@@ -240,82 +246,63 @@ async def delete_upload_batch(
     exam_id: str,
     batch_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    batch = await upload_batches_collection.find_one({"_id": bson.ObjectId(batch_id)})
-    if not batch or str(batch["exam_id"]) != exam_id:
+    b_res = await db.execute(select(UploadBatch).where(UploadBatch.id == batch_id))
+    batch = b_res.scalar_one_or_none()
+    if not batch or str(batch.exam_id) != exam_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
 
-    # Find all sheets created from this batch
-    sheets = await answer_sheets_collection.find({"batch_upload_id": bson.ObjectId(batch_id)}).to_list(length=None)
-    sheet_ids = [s["_id"] for s in sheets]
+    sh_res = await db.execute(select(AnswerSheet).where(AnswerSheet.batch_upload_id == batch_id))
+    sheets = sh_res.scalars().all()
+    sheet_ids = [s.id for s in sheets]
 
-    # Delete page image files
-    pages = await sheet_pages_collection.find({"sheet_id": {"$in": sheet_ids}}).to_list(length=None)
-    for page in pages:
-        image_path = page.get("image_path")
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
+    if sheet_ids:
+        p_res = await db.execute(select(SheetPage).where(SheetPage.sheet_id.in_(sheet_ids)))
+        pages = p_res.scalars().all()
+        for page in pages:
+            if page.image_path and os.path.exists(page.image_path):
+                os.remove(page.image_path)
 
-    # Delete original PDFs
-    for sheet in sheets:
-        pdf_path = sheet.get("original_pdf_path")
-        if pdf_path and os.path.exists(pdf_path):
-            os.remove(pdf_path)
+        for sheet in sheets:
+            if sheet.original_pdf_path and os.path.exists(sheet.original_pdf_path):
+                os.remove(sheet.original_pdf_path)
 
-    # Delete page records
-    await sheet_pages_collection.delete_many({"sheet_id": {"$in": sheet_ids}})
+        await db.execute(delete(SheetPage).where(SheetPage.sheet_id.in_(sheet_ids)))
+        await db.execute(delete(AnswerSheet).where(AnswerSheet.id.in_(sheet_ids)))
 
-    # Delete sheet records
-    await answer_sheets_collection.delete_many({"_id": {"$in": sheet_ids}})
-
-    # Delete batch record
-    await upload_batches_collection.delete_one({"_id": bson.ObjectId(batch_id)})
+    await db.delete(batch)
+    await db.commit()
 
 
 @router.get("/sheets/{sheet_id}/", response_model=AnswerSheetResponse)
 async def get_sheet(
     sheet_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
+    res = await db.execute(select(AnswerSheet).where(AnswerSheet.id == sheet_id))
+    sheet = res.scalar_one_or_none()
     if not sheet:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
 
-    exam = await exams_collection.find_one({"_id": sheet["exam_id"]})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
     return AnswerSheetResponse(
-        id=str(sheet["_id"]),
-        exam_id=str(sheet["exam_id"]),
-        subject_id=str(sheet["subject_id"]) if sheet.get("subject_id") else None,
-        student_name=sheet.get("student_name"),
-        roll_no=sheet.get("roll_no"),
-        class_label=sheet.get("class_label"),
-        original_filename=sheet["original_filename"],
-        student_id=str(sheet["student_id"]) if sheet.get("student_id") else None,
-        original_pdf_path=sheet.get("original_pdf_path"),
-        page_count=sheet.get("page_count", 0),
-        status=sheet.get("status", "pending_mapping"),
-        current_batch_id=str(sheet["current_batch_id"]) if sheet.get("current_batch_id") else None,
-        uploaded_by=str(sheet["uploaded_by"]) if sheet.get("uploaded_by") else None,
-        batch_upload_id=str(sheet["batch_upload_id"]) if sheet.get("batch_upload_id") else None,
-        created_at=sheet["created_at"],
-        updated_at=sheet.get("updated_at"),
+        id=str(sheet.id),
+        exam_id=str(sheet.exam_id),
+        subject_id=str(sheet.subject_id) if sheet.subject_id else None,
+        student_name=sheet.student_name,
+        roll_no=sheet.roll_no,
+        class_label=sheet.class_label,
+        original_filename=sheet.original_filename,
+        student_id=str(sheet.student_id) if sheet.student_id else None,
+        original_pdf_path=sheet.original_pdf_path,
+        page_count=sheet.page_count or 0,
+        status=sheet.status or "pending_mapping",
+        current_batch_id=str(sheet.current_batch_id) if sheet.current_batch_id else None,
+        uploaded_by=str(sheet.uploaded_by) if sheet.uploaded_by else None,
+        batch_upload_id=str(sheet.batch_upload_id) if sheet.batch_upload_id else None,
+        created_at=sheet.created_at,
+        updated_at=sheet.updated_at,
     )
 
 
@@ -323,25 +310,25 @@ async def get_sheet(
 async def get_sheet_pages(
     sheet_id: str,
     current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
-    if not sheet:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
-
-    pages = await sheet_pages_collection.find(
-        {"sheet_id": bson.ObjectId(sheet_id), "is_deleted": False}
-    ).sort("page_no", 1).to_list(length=None)
+    res = await db.execute(
+        select(SheetPage)
+        .where(SheetPage.sheet_id == sheet_id, SheetPage.is_deleted == False)
+        .order_by(SheetPage.page_no.asc())
+    )
+    pages = res.scalars().all()
 
     return [
         SheetPageResponse(
-            id=str(p["_id"]),
-            sheet_id=str(p["sheet_id"]),
-            page_no=p["page_no"],
-            image_path=p["image_path"],
-            width=p.get("width", 0),
-            height=p.get("height", 0),
-            is_deleted=p.get("is_deleted", False),
-            created_at=p["created_at"],
+            id=str(p.id),
+            sheet_id=str(p.sheet_id),
+            page_no=p.page_no,
+            image_path=p.image_path,
+            width=p.width or 0,
+            height=p.height or 0,
+            is_deleted=p.is_deleted or False,
+            created_at=p.created_at,
         )
         for p in pages
     ]
@@ -352,66 +339,53 @@ async def update_sheet_mapping(
     sheet_id: str,
     mapping: SheetMapping,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
+    res = await db.execute(select(AnswerSheet).where(AnswerSheet.id == sheet_id))
+    sheet = res.scalar_one_or_none()
     if not sheet:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
 
-    exam = await exams_collection.find_one({"_id": sheet["exam_id"]})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    update_dict = {}
     if mapping.student_name is not None:
-        update_dict["student_name"] = mapping.student_name
+        sheet.student_name = mapping.student_name
     if mapping.roll_no is not None:
-        update_dict["roll_no"] = mapping.roll_no
+        sheet.roll_no = mapping.roll_no
     if mapping.class_label is not None:
-        update_dict["class_label"] = mapping.class_label
+        sheet.class_label = mapping.class_label
     if mapping.student_id is not None:
-        enrollment = await exam_students_collection.find_one({
-            "exam_id": bson.ObjectId(str(exam["_id"])),
-            "student_id": bson.ObjectId(mapping.student_id),
-            "status": "active",
-        })
-        if not enrollment:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Student is not enrolled in this exam"
+        e_res = await db.execute(
+            select(ExamStudent).where(
+                ExamStudent.exam_id == sheet.exam_id,
+                ExamStudent.student_id == mapping.student_id,
+                ExamStudent.status == "active",
             )
-        update_dict["student_id"] = bson.ObjectId(mapping.student_id)
+        )
+        if not e_res.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Student is not enrolled in this exam")
+        sheet.student_id = mapping.student_id
 
-    update_dict["status"] = "mapped"
-    update_dict["updated_at"] = datetime.utcnow()
-
-    result = await answer_sheets_collection.find_one_and_update(
-        {"_id": bson.ObjectId(sheet_id)},
-        {"$set": update_dict},
-        return_document=True,
-    )
+    sheet.status = "mapped"
+    sheet.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(sheet)
 
     return AnswerSheetResponse(
-        id=str(result["_id"]),
-        exam_id=str(result["exam_id"]),
-        subject_id=str(result["subject_id"]) if result.get("subject_id") else None,
-        student_name=result.get("student_name"),
-        roll_no=result.get("roll_no"),
-        class_label=result.get("class_label"),
-        original_filename=result["original_filename"],
-        student_id=str(result["student_id"]) if result.get("student_id") else None,
-        original_pdf_path=result.get("original_pdf_path"),
-        page_count=result.get("page_count", 0),
-        status=result.get("status", "pending_mapping"),
-        current_batch_id=str(result["current_batch_id"]) if result.get("current_batch_id") else None,
-        uploaded_by=str(result["uploaded_by"]) if result.get("uploaded_by") else None,
-        batch_upload_id=str(result["batch_upload_id"]) if result.get("batch_upload_id") else None,
-        created_at=result["created_at"],
-        updated_at=result.get("updated_at"),
+        id=str(sheet.id),
+        exam_id=str(sheet.exam_id),
+        subject_id=str(sheet.subject_id) if sheet.subject_id else None,
+        student_name=sheet.student_name,
+        roll_no=sheet.roll_no,
+        class_label=sheet.class_label,
+        original_filename=sheet.original_filename,
+        student_id=str(sheet.student_id) if sheet.student_id else None,
+        original_pdf_path=sheet.original_pdf_path,
+        page_count=sheet.page_count or 0,
+        status=sheet.status or "pending_mapping",
+        current_batch_id=str(sheet.current_batch_id) if sheet.current_batch_id else None,
+        uploaded_by=str(sheet.uploaded_by) if sheet.uploaded_by else None,
+        batch_upload_id=str(sheet.batch_upload_id) if sheet.batch_upload_id else None,
+        created_at=sheet.created_at,
+        updated_at=sheet.updated_at,
     )
 
 
@@ -420,161 +394,121 @@ async def delete_sheet_page(
     sheet_id: str,
     page_no: int,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
-    if not sheet:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
-
-    exam = await exams_collection.find_one({"_id": sheet["exam_id"]})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    await sheet_pages_collection.update_one(
-        {"sheet_id": bson.ObjectId(sheet_id), "page_no": page_no},
-        {"$set": {"is_deleted": True}}
+    await db.execute(
+        update(SheetPage)
+        .where(SheetPage.sheet_id == sheet_id, SheetPage.page_no == page_no)
+        .values(is_deleted=True)
     )
+    await db.commit()
+
+    # Recalculate remaining active page count for the answer sheet
+    res_count = await db.execute(
+        select(func.count(SheetPage.id))
+        .where(SheetPage.sheet_id == sheet_id, SheetPage.is_deleted == False)
+    )
+    active_pages = res_count.scalar() or 0
+
+    await db.execute(
+        update(AnswerSheet)
+        .where(AnswerSheet.id == sheet_id)
+        .values(page_count=active_pages, updated_at=datetime.utcnow())
+    )
+    await db.commit()
 
 
 @router.delete("/sheets/{sheet_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_sheet(
     sheet_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
+    res = await db.execute(select(AnswerSheet).where(AnswerSheet.id == sheet_id))
+    sheet = res.scalar_one_or_none()
     if not sheet:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
 
-    if sheet["status"] != "pending_mapping":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can only delete sheets that are pending mapping"
-        )
-
-    exam = await exams_collection.find_one({"_id": sheet["exam_id"]})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    # Delete page image files
-    pages = await sheet_pages_collection.find({"sheet_id": bson.ObjectId(sheet_id)}).to_list(length=None)
+    p_res = await db.execute(select(SheetPage).where(SheetPage.sheet_id == sheet_id))
+    pages = p_res.scalars().all()
     for page in pages:
-        image_path = page.get("image_path")
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
+        if page.image_path and os.path.exists(page.image_path):
+            os.remove(page.image_path)
 
-    # Delete original PDF
-    pdf_path = sheet.get("original_pdf_path")
-    if pdf_path and os.path.exists(pdf_path):
-        os.remove(pdf_path)
+    if sheet.original_pdf_path and os.path.exists(sheet.original_pdf_path):
+        os.remove(sheet.original_pdf_path)
 
-    # Delete page records from DB
-    await sheet_pages_collection.delete_many({"sheet_id": bson.ObjectId(sheet_id)})
-
-    # Delete sheet record
-    await answer_sheets_collection.delete_one({"_id": bson.ObjectId(sheet_id)})
+    await db.execute(delete(SheetPage).where(SheetPage.sheet_id == sheet_id))
+    await db.delete(sheet)
+    await db.commit()
 
 
-@router.delete("/exams/{exam_id}/sheets/pending/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{exam_id}/sheets/pending/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_all_pending_sheets(
     exam_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
+    res = await db.execute(
+        select(AnswerSheet).where(
+            AnswerSheet.exam_id == exam_id,
+            AnswerSheet.status == "pending_mapping",
+        )
+    )
+    pending_sheets = res.scalars().all()
+    sheet_ids = [s.id for s in pending_sheets]
 
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    if sheet_ids:
+        p_res = await db.execute(select(SheetPage).where(SheetPage.sheet_id.in_(sheet_ids)))
+        pages = p_res.scalars().all()
+        for page in pages:
+            if page.image_path and os.path.exists(page.image_path):
+                os.remove(page.image_path)
 
-    # Find all pending sheets
-    pending_sheets = await answer_sheets_collection.find({
-        "exam_id": bson.ObjectId(exam_id),
-        "status": "pending_mapping",
-    }).to_list(length=None)
+        for sheet in pending_sheets:
+            if sheet.original_pdf_path and os.path.exists(sheet.original_pdf_path):
+                os.remove(sheet.original_pdf_path)
 
-    if not pending_sheets:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No pending sheets found")
-
-    sheet_ids = [s["_id"] for s in pending_sheets]
-
-    # Delete page image files
-    pages = await sheet_pages_collection.find({"sheet_id": {"$in": sheet_ids}}).to_list(length=None)
-    for page in pages:
-        image_path = page.get("image_path")
-        if image_path and os.path.exists(image_path):
-            os.remove(image_path)
-
-    # Delete original PDFs
-    for sheet in pending_sheets:
-        pdf_path = sheet.get("original_pdf_path")
-        if pdf_path and os.path.exists(pdf_path):
-            os.remove(pdf_path)
-
-    # Delete page records from DB
-    await sheet_pages_collection.delete_many({"sheet_id": {"$in": sheet_ids}})
-
-    # Delete sheet records
-    await answer_sheets_collection.delete_many({"_id": {"$in": sheet_ids}})
+        await db.execute(delete(SheetPage).where(SheetPage.sheet_id.in_(sheet_ids)))
+        await db.execute(delete(AnswerSheet).where(AnswerSheet.id.in_(sheet_ids)))
+        await db.commit()
 
 
 @router.post("/sheets/{sheet_id}/skip/", response_model=AnswerSheetResponse)
 async def skip_sheet(
     sheet_id: str,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    sheet = await answer_sheets_collection.find_one({"_id": bson.ObjectId(sheet_id)})
+    res = await db.execute(select(AnswerSheet).where(AnswerSheet.id == sheet_id))
+    sheet = res.scalar_one_or_none()
     if not sheet:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sheet not found")
 
-    exam = await exams_collection.find_one({"_id": sheet["exam_id"]})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    result = await answer_sheets_collection.find_one_and_update(
-        {"_id": bson.ObjectId(sheet_id)},
-        {"$set": {"status": "skipped", "updated_at": datetime.utcnow()}},
-        return_document=True,
-    )
+    sheet.status = "skipped"
+    sheet.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(sheet)
 
     return AnswerSheetResponse(
-        id=str(result["_id"]),
-        exam_id=str(result["exam_id"]),
-        subject_id=str(result["subject_id"]) if result.get("subject_id") else None,
-        student_name=result.get("student_name"),
-        roll_no=result.get("roll_no"),
-        class_label=result.get("class_label"),
-        original_filename=result["original_filename"],
-        student_id=str(result["student_id"]) if result.get("student_id") else None,
-        original_pdf_path=result.get("original_pdf_path"),
-        page_count=result.get("page_count", 0),
-        status=result.get("status", "pending_mapping"),
-        current_batch_id=str(result["current_batch_id"]) if result.get("current_batch_id") else None,
-        uploaded_by=str(result["uploaded_by"]) if result.get("uploaded_by") else None,
-        batch_upload_id=str(result["batch_upload_id"]) if result.get("batch_upload_id") else None,
-        created_at=result["created_at"],
-        updated_at=result.get("updated_at"),
+        id=str(sheet.id),
+        exam_id=str(sheet.exam_id),
+        subject_id=str(sheet.subject_id) if sheet.subject_id else None,
+        student_name=sheet.student_name,
+        roll_no=sheet.roll_no,
+        class_label=sheet.class_label,
+        original_filename=sheet.original_filename,
+        student_id=str(sheet.student_id) if sheet.student_id else None,
+        original_pdf_path=sheet.original_pdf_path,
+        page_count=sheet.page_count or 0,
+        status=sheet.status,
+        current_batch_id=str(sheet.current_batch_id) if sheet.current_batch_id else None,
+        uploaded_by=str(sheet.uploaded_by) if sheet.uploaded_by else None,
+        batch_upload_id=str(sheet.batch_upload_id) if sheet.batch_upload_id else None,
+        created_at=sheet.created_at,
+        updated_at=sheet.updated_at,
     )
 
-
-# ============================================================
-# Auto-Match Endpoints (Phase 12)
-# ============================================================
 
 @router.post("/{exam_id}/sheets/auto-match/")
 async def auto_match_sheets(
@@ -582,22 +516,11 @@ async def auto_match_sheets(
     request: AutoMatchRequest,
     current_user: UserResponse = Depends(require_roles("admin", "teacher")),
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
     matches_to_apply = [
         {"sheet_id": m.sheet_id, "student_id": m.student_id, "keep_parsed_name": m.keep_parsed_name}
         for m in request.matches
     ]
-    result = await apply_student_matches(exam_id, matches_to_apply)
-
-    return result
+    return await apply_student_matches(exam_id, matches_to_apply)
 
 
 @router.get("/{exam_id}/sheets/auto-match/suggestions/")
@@ -605,15 +528,5 @@ async def get_auto_match_suggestions(
     exam_id: str,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    exam = await exams_collection.find_one({"_id": bson.ObjectId(exam_id)})
-    if not exam:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
-
-    if current_user.role == "teacher":
-        cls = await classes_collection.find_one({"_id": bson.ObjectId(exam["class_id"])})
-        if not cls or current_user.id not in cls.get("teacher_ids", []):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
     suggestions = await find_student_matches(exam_id)
-
     return {"suggestions": suggestions, "total_pending": len(suggestions)}

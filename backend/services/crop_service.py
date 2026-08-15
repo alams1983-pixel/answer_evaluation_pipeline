@@ -1,18 +1,14 @@
 import os
 import base64
 import time
-import bson
-from typing import List, Dict, Any, Optional
-
+from datetime import datetime
+from typing import List, Dict, Any
 from PIL import Image
-import io
+from sqlalchemy import select, delete
 
 from core.config import settings
-from db.database import (
-    question_paper_crops_collection,
-    question_papers_collection,
-    exams_collection,
-)
+from db.database import AsyncSessionLocal
+from db.models import QuestionPaperCrop, QuestionPaper
 
 
 async def save_crop(
@@ -24,14 +20,6 @@ async def save_crop(
     bbox: Dict[str, int],
     image_data_base64: str,
 ) -> str:
-    """
-    Save a cropped image attachment for a question.
-
-    The frontend sends a base64-encoded PNG of the cropped region.
-    We decode it, save to storage, and create a DB record.
-
-    Returns: crop_id
-    """
     crop_dir = os.path.join(settings.STORAGE_PATH, "question_papers", exam_id, "crops")
     os.makedirs(crop_dir, exist_ok=True)
 
@@ -43,92 +31,103 @@ async def save_crop(
     with open(crop_path, "wb") as f:
         f.write(image_bytes)
 
-    qp = await question_papers_collection.find_one({"exam_id": exam_id})
-    qp_id = str(qp["_id"]) if qp else ""
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(QuestionPaper).where(QuestionPaper.exam_id == exam_id))
+        qp = res.scalar_one_or_none()
+        qp_id = str(qp.id) if qp else ""
 
-    crop_doc = {
-        "exam_id": exam_id,
-        "question_paper_id": qp_id,
-        "question_index": question_index,
-        "q_no": q_no,
-        "image_path": crop_path,
-        "source_pdf": source_pdf,
-        "page_no": page_no,
-        "bbox": {
-            "x": bbox.get("x", 0),
-            "y": bbox.get("y", 0),
-            "width": bbox.get("width", 0),
-            "height": bbox.get("height", 0),
-        },
-        "created_at": time.time(),
-    }
-
-    result = await question_paper_crops_collection.insert_one(crop_doc)
-    return str(result.inserted_id)
+        crop_obj = QuestionPaperCrop(
+            exam_id=exam_id,
+            question_paper_id=qp_id,
+            question_index=question_index,
+            q_no=q_no,
+            image_path=crop_path,
+            source_pdf=source_pdf,
+            page_no=page_no,
+            bbox={
+                "x": bbox.get("x", 0),
+                "y": bbox.get("y", 0),
+                "width": bbox.get("width", 0),
+                "height": bbox.get("height", 0),
+            },
+            created_at=datetime.utcnow(),
+        )
+        db.add(crop_obj)
+        await db.commit()
+        await db.refresh(crop_obj)
+        return str(crop_obj.id)
 
 
 async def delete_crop(crop_id: str) -> bool:
-    """Delete a crop record and its image file."""
-    crop = await question_paper_crops_collection.find_one({"_id": bson.ObjectId(crop_id)})
-    if not crop:
-        return False
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(QuestionPaperCrop).where(QuestionPaperCrop.id == crop_id))
+        crop = res.scalar_one_or_none()
+        if not crop:
+            return False
 
-    image_path = crop.get("image_path")
-    if image_path and os.path.exists(image_path):
-        os.remove(image_path)
+        image_path = crop.image_path
+        if image_path and os.path.exists(image_path):
+            os.remove(image_path)
 
-    await question_paper_crops_collection.delete_one({"_id": bson.ObjectId(crop_id)})
-    return True
+        await db.delete(crop)
+        await db.commit()
+        return True
 
 
 async def get_crops_for_question(
     exam_id: str,
     question_index: int,
 ) -> List[Dict[str, Any]]:
-    """Get all crop images attached to a specific question."""
-    crops = question_paper_crops_collection.find({
-        "exam_id": exam_id,
-        "question_index": question_index,
-    }).sort("created_at", 1)
-
-    result = []
-    async for crop in crops:
-        result.append({
-            "id": str(crop["_id"]),
-            "exam_id": crop["exam_id"],
-            "question_paper_id": str(crop["question_paper_id"]),
-            "question_index": crop["question_index"],
-            "q_no": crop["q_no"],
-            "image_path": crop["image_path"],
-            "source_pdf": crop["source_pdf"],
-            "page_no": crop["page_no"],
-            "bbox": crop["bbox"],
-            "created_at": crop["created_at"],
-        })
-    return result
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            select(QuestionPaperCrop)
+            .where(
+                QuestionPaperCrop.exam_id == exam_id,
+                QuestionPaperCrop.question_index == question_index,
+            )
+            .order_by(QuestionPaperCrop.created_at.asc())
+        )
+        crops = res.scalars().all()
+        return [
+            {
+                "id": str(crop.id),
+                "exam_id": crop.exam_id,
+                "question_paper_id": str(crop.question_paper_id),
+                "question_index": crop.question_index,
+                "q_no": crop.q_no,
+                "image_path": crop.image_path,
+                "source_pdf": crop.source_pdf,
+                "page_no": crop.page_no,
+                "bbox": crop.bbox,
+                "created_at": crop.created_at,
+            }
+            for crop in crops
+        ]
 
 
 async def get_all_crops_for_exam(exam_id: str) -> List[Dict[str, Any]]:
-    """Get all crop images for an exam."""
-    crops = question_paper_crops_collection.find({
-        "exam_id": exam_id,
-    }).sort("created_at", 1)
-
-    result = []
-    async for crop in crops:
-        result.append({
-            "id": str(crop["_id"]),
-            "exam_id": crop["exam_id"],
-            "question_paper_id": str(crop["question_paper_id"]),
-            "question_index": crop["question_index"],
-            "q_no": crop["q_no"],
-            "image_path": crop["image_path"],
-            "source_pdf": crop["source_pdf"],
-            "page_no": crop["page_no"],
-            "bbox": crop["bbox"],
-            "created_at": crop["created_at"],
-        })
-    return result
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            select(QuestionPaperCrop)
+            .where(QuestionPaperCrop.exam_id == exam_id)
+            .order_by(QuestionPaperCrop.created_at.asc())
+        )
+        crops = res.scalars().all()
+        return [
+            {
+                "id": str(crop.id),
+                "exam_id": crop.exam_id,
+                "question_paper_id": str(crop.question_paper_id),
+                "question_index": crop.question_index,
+                "q_no": crop.q_no,
+                "image_path": crop.image_path,
+                "source_pdf": crop.source_pdf,
+                "page_no": crop.page_no,
+                "bbox": crop.bbox,
+                "created_at": crop.created_at,
+            }
+            for crop in crops
+        ]
 
 
 async def extract_crop_from_pdf(
@@ -138,12 +137,6 @@ async def extract_crop_from_pdf(
     output_path: str,
     dpi: int = 150,
 ) -> bool:
-    """
-    Extract a region from a PDF page and save as PNG.
-    Used when the frontend sends bbox coordinates instead of a pre-cropped image.
-
-    Returns: True if successful
-    """
     try:
         import fitz
 

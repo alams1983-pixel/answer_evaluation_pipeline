@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '@/lib/auth';
 import { apiGet, apiPost, apiPatch, apiDelete } from '@/lib/api';
 import SchemaBuilder from '@/components/SchemaBuilder';
@@ -95,30 +95,33 @@ export default function ResultSchemasPage() {
     }
   };
 
+  const handleBuilderFieldsChange = useCallback((fields: SchemaField[]) => {
+    setBuilderFields(fields);
+  }, []);
+
   const handleSave = async () => {
-    if (!schemaName.trim()) {
-      setError('Schema name is required');
-      return;
-    }
+    const finalSchemaName = schemaName.trim() || 'New Result Schema';
     if (builderFields.length === 0) {
-      setError('Add at least one field');
+      setError('Add at least one field in the schema builder');
       return;
     }
 
     setSaving(true);
+    setError(null);
+    setSuccess(null);
     try {
       const schemaDefinition = fieldsToJsonSchema(builderFields);
 
       if (editingSchema) {
         await apiPatch(`/exams/result-schemas/${editingSchema.id}/`, {
-          name: schemaName,
+          name: finalSchemaName,
           description: schemaDescription || undefined,
           schema_definition: schemaDefinition,
         });
         setSuccess('Schema updated successfully');
       } else {
         await apiPost('/exams/result-schemas/', {
-          name: schemaName,
+          name: finalSchemaName,
           description: schemaDescription || undefined,
           schema_definition: schemaDefinition,
         });
@@ -126,7 +129,7 @@ export default function ResultSchemasPage() {
       }
 
       setViewMode('list');
-      loadSchemas();
+      await loadSchemas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save schema');
     } finally {
@@ -258,7 +261,7 @@ export default function ResultSchemasPage() {
           <div className="panel" style={{ padding: '1.5rem', marginBottom: '1.5rem' }}>
             <SchemaBuilder
               initialFields={builderFields.length > 0 ? builderFields : undefined}
-              onChange={(fields) => setBuilderFields(fields)}
+              onChange={handleBuilderFieldsChange}
             />
           </div>
 
@@ -266,7 +269,7 @@ export default function ResultSchemasPage() {
             <button className="btn btn-secondary" onClick={() => setViewMode('list')}>
               Cancel
             </button>
-            <button className="btn btn-primary" onClick={handleSave} disabled={saving || !schemaName.trim() || builderFields.length === 0}>
+            <button className="btn btn-primary" onClick={handleSave} disabled={saving || builderFields.length === 0}>
               {saving ? 'Saving...' : viewMode === 'create' ? 'Create Schema' : 'Update Schema'}
             </button>
           </div>

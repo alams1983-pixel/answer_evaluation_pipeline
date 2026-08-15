@@ -116,10 +116,14 @@ export default function DoneStep({ examId, onBackToMapping }: DoneStepProps) {
             Continue Mapping
           </button>
         )}
-        <Link href={`/exams/${examId}`} className="btn btn-primary">
-          Back to Exam Details
+        <Link href={`/exams/${examId}/batches`} className="btn btn-primary">
+          Go to Batches &amp; Run AI Evaluation &rarr;
+        </Link>
+        <Link href={`/exams/${examId}`} className="btn btn-secondary">
+          Exam Details
         </Link>
       </div>
     </div>
   );
 }
+

@@ -142,6 +142,46 @@ export default function ZipUpload({ examId, onUploadComplete }: ZipUploadProps) 
         <span className="section-badge">ZIP</span>
       </div>
 
+      {/* Naming Guidelines Card */}
+      <div
+        style={{
+          marginBottom: '1.25rem',
+          padding: '1rem 1.25rem',
+          background: 'var(--bg-secondary)',
+          border: '1px solid var(--border-default)',
+          borderRadius: 'var(--radius-lg)',
+          fontSize: '0.875rem',
+          color: 'var(--text-secondary)',
+        }}
+      >
+        <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <span style={{ fontSize: '1.1rem' }}>💡</span> ZIP File Naming Guidelines for Automatic Student Matching
+        </div>
+        <p style={{ margin: '0 0 0.5rem 0', lineHeight: 1.4 }}>
+          To enable <strong>Automatic Student Matching</strong>, name the PDF files inside your ZIP archive using any of these conventions:
+        </p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.5rem', marginBottom: '0.5rem' }}>
+          <div style={{ padding: '0.5rem 0.75rem', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+            <div style={{ fontWeight: 600, color: 'var(--accent-primary)', fontSize: '0.8rem' }}>Format 1: Full Pattern</div>
+            <code>Name_RollNo_Class.pdf</code>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>e.g., <code>JohnDoe_01_10A.pdf</code></div>
+          </div>
+          <div style={{ padding: '0.5rem 0.75rem', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+            <div style={{ fontWeight: 600, color: 'var(--accent-primary)', fontSize: '0.8rem' }}>Format 2: Name & Roll</div>
+            <code>Name_RollNo.pdf</code>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>e.g., <code>JaneSmith_02.pdf</code></div>
+          </div>
+          <div style={{ padding: '0.5rem 0.75rem', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+            <div style={{ fontWeight: 600, color: 'var(--accent-primary)', fontSize: '0.8rem' }}>Format 3: Roll Number Only</div>
+            <code>RollNo.pdf</code>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>e.g., <code>01.pdf</code> or <code>Roll_05.pdf</code></div>
+          </div>
+        </div>
+        <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+          <span>ℹ️</span> <em>Files with arbitrary names (e.g. <code>scan_001.pdf</code>) will be uploaded safely and can be matched to students with 1 click.</em>
+        </div>
+      </div>
+
       {/* Upload Area */}
       <div
         className={`panel ${dragActive ? 'drag-active' : ''}`}

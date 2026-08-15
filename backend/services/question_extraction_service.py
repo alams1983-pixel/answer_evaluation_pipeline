@@ -2,20 +2,17 @@ import os
 import json
 import asyncio
 import time
-import bson
+from datetime import datetime
 import concurrent.futures
 from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
+from sqlalchemy import select, delete
 
 from core.config import settings, COMPLEXITY_EXTRACTION_MODEL
 from services.pdf_service import rasterize_pdf_to_pngs
-from db.database import (
-    question_papers_collection,
-    extraction_tasks_collection,
-    answer_keys_collection,
-    exams_collection,
-)
+from db.database import AsyncSessionLocal
+from db.models import QuestionPaper, ExtractionTask, AnswerKey, Exam
 
 
 PAGE_ANALYSIS_PROMPT = """Analyze this question paper page. Return ONLY valid JSON (no markdown, no code blocks) with this exact structure:
@@ -97,8 +94,10 @@ Rules:
 
 
 def _call_gemini_vision(image_path: str, prompt: str, model: str = COMPLEXITY_EXTRACTION_MODEL) -> str:
-    """Send an image + prompt to Gemini and return the text response."""
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    api_key = settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not provided in backend/.env file.")
+    client = genai.Client(api_key=api_key)
 
     with open(image_path, "rb") as f:
         image_bytes = f.read()
@@ -123,15 +122,16 @@ def _call_gemini_vision(image_path: str, prompt: str, model: str = COMPLEXITY_EX
     )
 
     if not response or not response.text:
-        raise ValueError(f"Gemini returned empty response for text analysis. "
-                        f"Finish reason: {getattr(response, 'finish_reason', 'unknown') if response else 'no response'}")
+        raise ValueError("Gemini returned empty response for text analysis.")
 
     return response.text
 
 
 def _call_gemini_text(prompt: str, model: str = COMPLEXITY_EXTRACTION_MODEL) -> str:
-    """Send a text-only prompt to Gemini and return the response."""
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    api_key = settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not provided in backend/.env file.")
+    client = genai.Client(api_key=api_key)
 
     response = client.models.generate_content(
         model=model,
@@ -144,14 +144,12 @@ def _call_gemini_text(prompt: str, model: str = COMPLEXITY_EXTRACTION_MODEL) -> 
     )
 
     if not response or not response.text:
-        raise ValueError(f"Gemini returned empty response for page analysis. "
-                        f"Finish reason: {getattr(response, 'finish_reason', 'unknown') if response else 'no response'}")
+        raise ValueError("Gemini returned empty response for page analysis.")
 
     return response.text
 
 
 def _clean_json_response(raw: str) -> str:
-    """Strip markdown code fences if present."""
     if raw is None:
         raise ValueError("Received None response from AI")
     raw = raw.strip()
@@ -167,7 +165,6 @@ def _clean_json_response(raw: str) -> str:
 
 
 def _analyze_page(args):
-    """Worker function for parallel page analysis."""
     page_idx, image_path, exam_id = args
     page_no = page_idx + 1
 
@@ -184,43 +181,39 @@ _extraction_tasks: set = set()
 
 
 async def start_extraction(exam_id: str, pdf_path: str, total_marks: int) -> str:
-    """
-    Start the extraction pipeline asynchronously.
-    Returns the extraction_task_id.
-    """
     output_dir = os.path.join(settings.STORAGE_PATH, "question_papers", exam_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Clear any existing task and question paper for this exam to allow re-upload
-    await extraction_tasks_collection.delete_many({"exam_id": exam_id})
-    await question_papers_collection.delete_many({"exam_id": exam_id})
-    await answer_keys_collection.update_one(
-        {"exam_id": exam_id},
-        {"$set": {
-            "question_paper_id": None,
-            "included_page_refs": [],
-            "excluded_page_refs": [],
-            "questions": [],
-            "source": "manual",
-            "extraction_status": "none",
-        }}
-    )
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(ExtractionTask).where(ExtractionTask.exam_id == exam_id))
+        await db.execute(delete(QuestionPaper).where(QuestionPaper.exam_id == exam_id))
 
-    task_doc = {
-        "exam_id": exam_id,
-        "status": "rasterizing",
-        "total_pages": 0,
-        "processed_pages": 0,
-        "current_page": 0,
-        "current_step": "Converting PDF to images...",
-        "questions_found_so_far": 0,
-        "error": None,
-        "started_at": time.time(),
-        "completed_at": None,
-    }
+        ak_res = await db.execute(select(AnswerKey).where(AnswerKey.exam_id == exam_id))
+        ak = ak_res.scalar_one_or_none()
+        if ak:
+            ak.question_paper_id = None
+            ak.included_page_refs = []
+            ak.excluded_page_refs = []
+            ak.questions = []
+            ak.source = "manual"
+            ak.extraction_status = "none"
 
-    task_result = await extraction_tasks_collection.insert_one(task_doc)
-    task_id = str(task_result.inserted_id)
+        task_obj = ExtractionTask(
+            exam_id=exam_id,
+            status="rasterizing",
+            total_pages=0,
+            processed_pages=0,
+            current_page=0,
+            current_step="Converting PDF to images...",
+            questions_found_so_far=0,
+            error=None,
+            started_at=datetime.utcnow(),
+            completed_at=None,
+        )
+        db.add(task_obj)
+        await db.commit()
+        await db.refresh(task_obj)
+        task_id = str(task_obj.id)
 
     task = asyncio.create_task(_run_extraction(exam_id, pdf_path, output_dir, total_marks, task_id))
     _extraction_tasks.add(task)
@@ -236,13 +229,6 @@ async def _run_extraction(
     total_marks: int,
     task_id: str,
 ):
-    """
-    Full extraction pipeline:
-    1. Rasterize PDF to page images
-    2. Analyze each page with AI (parallel)
-    3. Consolidate results
-    4. Save to question_papers and answer_keys collections
-    """
     try:
         await _update_task(task_id, status="rasterizing", current_step="Converting PDF to images...")
 
@@ -253,8 +239,8 @@ async def _run_extraction(
             await _update_task(
                 task_id,
                 status="failed",
-                error="The PDF contains no pages. Please upload a valid question paper.",
-                completed_at=time.time(),
+                error="The PDF contains no pages.",
+                completed_at=datetime.utcnow(),
             )
             return
 
@@ -278,7 +264,6 @@ async def _run_extraction(
                 page_no, result, error = future.result()
                 if error:
                     failure_count += 1
-                    print(f"[Extraction] Page {page_no} analysis failed: {error}")
                     page_analyses.append({
                         "page_no": page_no,
                         "analysis": {
@@ -294,19 +279,11 @@ async def _run_extraction(
                     })
 
                     if failure_count >= failure_threshold:
-                        print(f"[Extraction] Too many failures ({failure_count}/{total_pages}). Aborting.")
-                        for f in futures:
-                            if not f.done():
-                                f.cancel()
-                            try:
-                                f.result()
-                            except (concurrent.futures.CancelledError, Exception):
-                                pass
                         await _update_task(
                             task_id,
                             status="failed",
-                            error=f"Extraction aborted: {failure_count}/{total_pages} pages failed. The model may be unavailable or the PDF is unreadable. Last error: {error}",
-                            completed_at=time.time(),
+                            error=f"Extraction aborted: {failure_count}/{total_pages} pages failed. Error: {error}",
+                            completed_at=datetime.utcnow(),
                         )
                         return
                 else:
@@ -388,72 +365,66 @@ async def _run_extraction(
                 "diagram_page_refs": [],
             })
 
-        qp_doc = {
-            "exam_id": exam_id,
-            "source_file": pdf_path,
-            "total_pages": total_pages,
-            "pages": pages_data,
-            "extracted_questions": extracted_questions,
-            "status": "extracted",
-            "extraction_model": COMPLEXITY_EXTRACTION_MODEL,
-            "warnings": warnings,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
+        async with AsyncSessionLocal() as db:
+            qp_obj = QuestionPaper(
+                exam_id=exam_id,
+                source_file=pdf_path,
+                total_pages=total_pages,
+                pages=pages_data,
+                extracted_questions=extracted_questions,
+                status="extracted",
+                extraction_model=COMPLEXITY_EXTRACTION_MODEL,
+                warnings=warnings,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(qp_obj)
+            await db.commit()
+            await db.refresh(qp_obj)
+            qp_id = str(qp_obj.id)
 
-        qp_result = await question_papers_collection.insert_one(qp_doc)
-        qp_id = str(qp_result.inserted_id)
-
-        await answer_keys_collection.update_one(
-            {"exam_id": exam_id},
-            {
-                "$set": {
-                    "question_paper_id": qp_id,
-                    "questions": extracted_questions,
-                    "source": "ai_extracted",
-                    "extraction_status": "completed",
-                },
-                "$setOnInsert": {
-                    "exam_id": exam_id,
-                    "included_page_refs": included_refs,
-                    "excluded_page_refs": excluded_refs,
-                    "sample_sheets": [],
-                    "created_at": time.time(),
-                },
-            },
-            upsert=True,
-        )
+            ak_res = await db.execute(select(AnswerKey).where(AnswerKey.exam_id == exam_id))
+            ak = ak_res.scalar_one_or_none()
+            if ak:
+                ak.question_paper_id = qp_id
+                ak.questions = extracted_questions
+                ak.source = "ai_extracted"
+                ak.extraction_status = "completed"
+                ak.included_page_refs = included_refs
+                ak.excluded_page_refs = excluded_refs
+            else:
+                ak = AnswerKey(
+                    exam_id=exam_id,
+                    question_paper_id=qp_id,
+                    questions=extracted_questions,
+                    source="ai_extracted",
+                    extraction_status="completed",
+                    included_page_refs=included_refs,
+                    excluded_page_refs=excluded_refs,
+                    sample_sheets=[],
+                    created_at=datetime.utcnow(),
+                )
+                db.add(ak)
+            await db.commit()
 
         await _update_task(
             task_id,
             status="completed",
             current_step="Extraction complete!",
-            completed_at=time.time(),
+            completed_at=datetime.utcnow(),
         )
 
     except Exception as e:
         error_msg = str(e)
-        # Make common errors user-friendly
-        if "NOT_FOUND" in error_msg and "model" in error_msg.lower():
-            error_msg = "AI model is currently unavailable. Please try again later or contact support."
-        elif "empty response" in error_msg.lower():
-            error_msg = "AI returned an empty response. The PDF page may be blank or unreadable. Try a higher quality PDF."
-        elif "403" in error_msg or "permission" in error_msg.lower():
-            error_msg = "AI access denied. Check your API key configuration."
-        elif "quota" in error_msg.lower() or "rate" in error_msg.lower():
-            error_msg = "AI service rate limit exceeded. Please wait a few minutes and try again."
-
         await _update_task(
             task_id,
             status="failed",
             error=f"Extraction failed: {error_msg}",
-            completed_at=time.time(),
+            completed_at=datetime.utcnow(),
         )
-        print(f"[Extraction] Failed for exam {exam_id}: {e}")
 
 
 def _build_page_reason(page_no: int, analysis: dict) -> str:
-    """Build a human-readable reason for page inclusion."""
     questions = analysis.get("questions_found", [])
     visual = analysis.get("visual_elements", [])
 
@@ -475,54 +446,57 @@ def _build_page_reason(page_no: int, analysis: dict) -> str:
 
 
 async def _update_task(task_id: str, **kwargs):
-    """Update extraction task in database."""
-    if kwargs:
-        await extraction_tasks_collection.update_one(
-            {"_id": bson.ObjectId(task_id)},
-            {"$set": kwargs},
-        )
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(ExtractionTask).where(ExtractionTask.id == task_id))
+        task = res.scalar_one_or_none()
+        if task:
+            for k, v in kwargs.items():
+                setattr(task, k, v)
+            await db.commit()
 
 
 async def get_extraction_status(task_id: str) -> Optional[Dict[str, Any]]:
-    """Get extraction task status."""
-    task = await extraction_tasks_collection.find_one({"_id": bson.ObjectId(task_id)})
-    if not task:
-        return None
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(ExtractionTask).where(ExtractionTask.id == task_id))
+        task = res.scalar_one_or_none()
+        if not task:
+            return None
 
-    return {
-        "id": str(task["_id"]),
-        "exam_id": task["exam_id"],
-        "status": task.get("status", "pending"),
-        "total_pages": task.get("total_pages", 0),
-        "processed_pages": task.get("processed_pages", 0),
-        "current_page": task.get("current_page", 0),
-        "current_step": task.get("current_step", ""),
-        "questions_found_so_far": task.get("questions_found_so_far", 0),
-        "error": task.get("error"),
-        "started_at": task.get("started_at"),
-        "completed_at": task.get("completed_at"),
-    }
+        return {
+            "id": str(task.id),
+            "exam_id": task.exam_id,
+            "status": task.status or "pending",
+            "total_pages": task.total_pages or 0,
+            "processed_pages": task.processed_pages or 0,
+            "current_page": task.current_page or 0,
+            "current_step": task.current_step or "",
+            "questions_found_so_far": task.questions_found_so_far or 0,
+            "error": task.error,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+        }
 
 
 async def get_question_paper(exam_id: str) -> Optional[Dict[str, Any]]:
-    """Get question paper for an exam."""
-    qp = await question_papers_collection.find_one({"exam_id": exam_id})
-    if not qp:
-        return None
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(QuestionPaper).where(QuestionPaper.exam_id == exam_id))
+        qp = res.scalar_one_or_none()
+        if not qp:
+            return None
 
-    return {
-        "id": str(qp["_id"]),
-        "exam_id": qp["exam_id"],
-        "source_file": qp["source_file"],
-        "total_pages": qp["total_pages"],
-        "pages": qp.get("pages", []),
-        "extracted_questions": qp.get("extracted_questions", []),
-        "status": qp.get("status", "pending_extraction"),
-        "extraction_model": qp.get("extraction_model"),
-        "warnings": qp.get("warnings", []),
-        "created_at": qp.get("created_at"),
-        "updated_at": qp.get("updated_at"),
-    }
+        return {
+            "id": str(qp.id),
+            "exam_id": qp.exam_id,
+            "source_file": qp.source_file,
+            "total_pages": qp.total_pages or 0,
+            "pages": qp.pages or [],
+            "extracted_questions": qp.extracted_questions or [],
+            "status": qp.status or "pending_extraction",
+            "extraction_model": qp.extraction_model,
+            "warnings": qp.warnings or [],
+            "created_at": qp.created_at,
+            "updated_at": qp.updated_at,
+        }
 
 
 async def update_question_paper_review(
@@ -531,33 +505,25 @@ async def update_question_paper_review(
     excluded_page_refs: List[int],
     questions: Optional[List[dict]] = None,
 ) -> bool:
-    """Update question paper review: confirm pages and edit questions."""
-    qp = await question_papers_collection.find_one({"exam_id": exam_id})
-    if not qp:
-        return False
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(QuestionPaper).where(QuestionPaper.exam_id == exam_id))
+        qp = res.scalar_one_or_none()
+        if not qp:
+            return False
 
-    updates = {
-        "included_page_refs": included_page_refs,
-        "excluded_page_refs": excluded_page_refs,
-        "updated_at": time.time(),
-    }
+        if questions is not None:
+            qp.extracted_questions = questions
+            qp.status = "reviewed"
 
-    if questions is not None:
-        updates["extracted_questions"] = questions
-        updates["status"] = "reviewed"
+        qp.updated_at = datetime.utcnow()
 
-    await question_papers_collection.update_one(
-        {"_id": qp["_id"]},
-        {"$set": updates},
-    )
+        ak_res = await db.execute(select(AnswerKey).where(AnswerKey.exam_id == exam_id))
+        ak = ak_res.scalar_one_or_none()
+        if ak:
+            ak.included_page_refs = included_page_refs
+            ak.excluded_page_refs = excluded_page_refs
+            if questions is not None:
+                ak.questions = questions
 
-    await answer_keys_collection.update_one(
-        {"exam_id": exam_id},
-        {"$set": {
-            "included_page_refs": included_page_refs,
-            "excluded_page_refs": excluded_page_refs,
-            "questions": questions if questions is not None else qp.get("extracted_questions", []),
-        }},
-    )
-
-    return True
+        await db.commit()
+        return True

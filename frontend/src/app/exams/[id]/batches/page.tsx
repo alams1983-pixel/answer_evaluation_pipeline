@@ -649,8 +649,9 @@ export default function BatchesPage() {
                         {item.sheet_id.slice(-8)}
                       </td>
                       <td style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
-                        {item.promptPreview || '-'}
+                        {item.prompt_preview || '-'}
                       </td>
+
                       <td>{getItemStatusBadge(item.status)}</td>
                       <td>
                         {selectedBatch.status === 'draft' && item.status === 'pending' && (

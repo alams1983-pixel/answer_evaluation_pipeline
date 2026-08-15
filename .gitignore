@@ -41,3 +41,7 @@ backend/storage/*
 Thumbs.db
 .vscode/
 .idea/
+
+# Generated batch input/output files
+*.jsonl
+

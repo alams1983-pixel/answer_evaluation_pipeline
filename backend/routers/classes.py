@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import List
 from datetime import datetime
-import bson
 
 from models.auth import UserResponse
 from models.school import ClassCreate, ClassUpdate, ClassResponse
 from core.deps import get_current_user, require_roles
-from db.database import classes_collection, users_collection
+from db.database import get_db
+from db.models import Class
 
 router = APIRouter(
     prefix="/classes",
@@ -17,26 +19,27 @@ router = APIRouter(
 @router.get("/", response_model=List[ClassResponse])
 async def list_classes(
     session: str | None = None,
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    query = {}
+    query = select(Class)
     if session:
-        query["session"] = session
-    if current_user.role == "teacher":
-        query["teacher_ids"] = current_user.id
+        query = query.where(Class.session == session)
 
-    classes = await classes_collection.find(query).to_list(length=None)
+    result = await db.execute(query)
+    classes = result.scalars().all()
+
     return [
         ClassResponse(
-            id=str(c["_id"]),
-            name=c["name"],
-            session=c.get("session", c.get("academic_year", "")),
-            section=c.get("section"),
-            teacher_ids=c.get("teacher_ids", []),
-            class_teacher_id=c.get("class_teacher_id"),
-            created_by=str(c["created_by"]) if c.get("created_by") else None,
-            created_at=c["created_at"],
-            updated_at=c.get("updated_at"),
+            id=str(c.id),
+            name=c.name,
+            session=c.session or "",
+            section=c.section,
+            teacher_ids=[],
+            class_teacher_id=c.class_teacher_id,
+            created_by=str(c.created_by) if c.created_by else None,
+            created_at=c.created_at,
+            updated_at=c.updated_at,
         )
         for c in classes
     ]
@@ -44,93 +47,96 @@ async def list_classes(
 @router.post("/", response_model=ClassResponse, status_code=status.HTTP_201_CREATED)
 async def create_class(
     class_data: ClassCreate,
-    current_user: UserResponse = Depends(require_roles("admin", "teacher"))
+    current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    existing = await classes_collection.find_one({
-        "name": class_data.name,
-        "section": class_data.section,
-        "session": class_data.session,
-    })
-    if existing:
+    query = select(Class).where(
+        Class.name == class_data.name,
+        Class.section == class_data.section,
+        Class.session == class_data.session,
+    )
+    res = await db.execute(query)
+    if res.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"A class '{class_data.name}' with section '{class_data.section or 'N/A'}' already exists for session '{class_data.session}'"
         )
 
-    class_doc = {
-        "name": class_data.name,
-        "section": class_data.section,
-        "session": class_data.session,
-        "teacher_ids": class_data.teacher_ids,
-        "class_teacher_id": class_data.class_teacher_id,
-        "created_by": bson.ObjectId(current_user.id),
-        "created_at": datetime.utcnow(),
-        "updated_at": None,
-    }
-
-    result = await classes_collection.insert_one(class_doc)
-    class_doc["_id"] = result.inserted_id
+    new_class = Class(
+        name=class_data.name,
+        section=class_data.section,
+        session=class_data.session,
+        class_teacher_id=class_data.class_teacher_id,
+        created_by=current_user.id,
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_class)
+    await db.commit()
+    await db.refresh(new_class)
 
     return ClassResponse(
-        id=str(result.inserted_id),
-        name=class_doc["name"],
-        section=class_doc["section"],
-        session=class_doc["session"],
-        teacher_ids=class_doc["teacher_ids"],
-        class_teacher_id=class_doc["class_teacher_id"],
+        id=str(new_class.id),
+        name=new_class.name,
+        section=new_class.section,
+        session=new_class.session,
+        teacher_ids=class_data.teacher_ids or [],
+        class_teacher_id=new_class.class_teacher_id,
         created_by=current_user.id,
-        created_at=class_doc["created_at"],
-        updated_at=class_doc["updated_at"],
+        created_at=new_class.created_at,
+        updated_at=new_class.updated_at,
     )
 
 @router.patch("/{class_id}", response_model=ClassResponse)
 async def update_class(
     class_id: str,
     update_data: ClassUpdate,
-    current_user: UserResponse = Depends(require_roles("admin", "teacher"))
+    current_user: UserResponse = Depends(require_roles("admin", "teacher")),
+    db: AsyncSession = Depends(get_db)
 ):
-    if current_user.role == "teacher":
-        existing_class = await classes_collection.find_one({"_id": bson.ObjectId(class_id)})
-        if not existing_class:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class not found")
-        if current_user.id not in existing_class.get("teacher_ids", []):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to manage this class"
-            )
+    res = await db.execute(select(Class).where(Class.id == class_id))
+    existing_class = res.scalar_one_or_none()
+    if not existing_class:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class not found")
 
     update_dict = update_data.dict(exclude_unset=True)
     if not update_dict:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No update data provided")
 
-    update_dict["updated_at"] = datetime.utcnow()
+    if "name" in update_dict:
+        existing_class.name = update_dict["name"]
+    if "session" in update_dict:
+        existing_class.session = update_dict["session"]
+    if "section" in update_dict:
+        existing_class.section = update_dict["section"]
+    if "class_teacher_id" in update_dict:
+        existing_class.class_teacher_id = update_dict["class_teacher_id"]
 
-    result = await classes_collection.find_one_and_update(
-        {"_id": bson.ObjectId(class_id)},
-        {"$set": update_dict},
-        return_document=True
-    )
-
-    if not result:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class not found")
+    existing_class.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(existing_class)
 
     return ClassResponse(
-        id=str(result["_id"]),
-        name=result["name"],
-        section=result.get("section"),
-        session=result.get("session", result.get("academic_year", "")),
-        teacher_ids=result.get("teacher_ids", []),
-        class_teacher_id=result.get("class_teacher_id"),
-        created_by=str(result["created_by"]) if result.get("created_by") else None,
-        created_at=result["created_at"],
-        updated_at=result.get("updated_at"),
+        id=str(existing_class.id),
+        name=existing_class.name,
+        section=existing_class.section,
+        session=existing_class.session,
+        teacher_ids=update_data.teacher_ids or [],
+        class_teacher_id=existing_class.class_teacher_id,
+        created_by=str(existing_class.created_by) if existing_class.created_by else None,
+        created_at=existing_class.created_at,
+        updated_at=existing_class.updated_at,
     )
 
 @router.delete("/{class_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_class(
     class_id: str,
-    current_user: UserResponse = Depends(require_roles("admin"))
+    current_user: UserResponse = Depends(require_roles("admin")),
+    db: AsyncSession = Depends(get_db)
 ):
-    result = await classes_collection.delete_one({"_id": bson.ObjectId(class_id)})
-    if result.deleted_count == 0:
+    res = await db.execute(select(Class).where(Class.id == class_id))
+    existing_class = res.scalar_one_or_none()
+    if not existing_class:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class not found")
+
+    await db.delete(existing_class)
+    await db.commit()

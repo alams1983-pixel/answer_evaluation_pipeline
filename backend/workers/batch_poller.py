@@ -1,18 +1,13 @@
 import asyncio
 import json
-import bson
 import os
 import re
 from datetime import datetime
 from typing import List, Dict, Any
-from db.database import (
-    batch_jobs_collection,
-    batch_items_collection,
-    answer_sheets_collection,
-    gradings_collection,
-    result_schemas_collection,
-    exams_collection,
-)
+from sqlalchemy import select, update
+
+from db.database import AsyncSessionLocal
+from db.models import BatchJob, BatchItem, AnswerSheet, Exam, Grading
 from services import batch_service
 from services import jsonl_service
 from services.grading_service import validate_result_against_schema, upsert_grading
@@ -54,8 +49,8 @@ async def process_single_result(
     batch_id: str,
     exam_id: str,
     result_schema_id: str,
-    items_by_custom_id: Dict[str, Dict[str, Any]],
-    sheets_by_id: Dict[str, Dict[str, Any]],
+    items_by_custom_id: Dict[str, Any],
+    sheets_by_id: Dict[str, Any],
 ) -> None:
     key = result_line.get("key", result_line.get("custom_id"))
 
@@ -63,113 +58,118 @@ async def process_single_result(
     if not item:
         return
 
-    sheet_id = item["sheet_id"]
-    sheet = sheets_by_id.get(str(sheet_id))
+    sheet_id = str(item.sheet_id)
+    sheet = sheets_by_id.get(sheet_id)
     if not sheet:
         return
 
-    if "error" in result_line and result_line["error"]:
-        await batch_items_collection.update_one(
-            {"_id": item["_id"]},
-            {
-                "$set": {
-                    "status": "failed",
-                    "error": str(result_line["error"]),
-                    "raw_response": result_line.get("response", result_line.get("body")),
-                }
-            }
+    async with AsyncSessionLocal() as db:
+        if "error" in result_line and result_line["error"]:
+            await db.execute(
+                update(BatchItem)
+                .where(BatchItem.id == item.id)
+                .values(
+                    status="failed",
+                    error=str(result_line["error"]),
+                    raw_response=result_line.get("response", result_line.get("body")),
+                )
+            )
+            await db.execute(
+                update(AnswerSheet)
+                .where(AnswerSheet.id == sheet_id)
+                .values(status="failed", updated_at=datetime.utcnow())
+            )
+            await db.commit()
+            return
+
+        response_data = result_line.get("response", result_line.get("body", {}))
+
+        grading_result = None
+        if response_data:
+            if isinstance(response_data, dict):
+                candidates = response_data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    for part in parts:
+                        if "text" in part:
+                            grading_result = _try_parse_json(part["text"])
+                            if grading_result:
+                                break
+                elif "result" in response_data:
+                    grading_result = _try_parse_json(response_data["result"])
+                elif "choices" in response_data:
+                    content = response_data["choices"][0].get("message", {}).get("content", "")
+                    grading_result = _try_parse_json(content)
+
+        if not grading_result:
+            await db.execute(
+                update(BatchItem)
+                .where(BatchItem.id == item.id)
+                .values(
+                    status="failed",
+                    error="Could not extract grading from response",
+                    raw_response=response_data,
+                )
+            )
+            await db.execute(
+                update(AnswerSheet)
+                .where(AnswerSheet.id == sheet_id)
+                .values(status="failed", updated_at=datetime.utcnow())
+            )
+            await db.commit()
+            return
+
+        is_valid, error_msg = await validate_result_against_schema(grading_result, result_schema_id)
+        if not is_valid:
+            await db.execute(
+                update(BatchItem)
+                .where(BatchItem.id == item.id)
+                .values(
+                    status="failed",
+                    error=f"Schema validation failed: {error_msg}",
+                    raw_response=response_data,
+                )
+            )
+            await db.execute(
+                update(AnswerSheet)
+                .where(AnswerSheet.id == sheet_id)
+                .values(status="failed", updated_at=datetime.utcnow())
+            )
+            await db.commit()
+            return
+
+        await db.execute(
+            update(BatchItem)
+            .where(BatchItem.id == item.id)
+            .values(
+                status="completed",
+                raw_response=response_data,
+                error=None,
+            )
         )
-        await answer_sheets_collection.update_one(
-            {"_id": sheet_id},
-            {"$set": {"status": "failed", "updated_at": datetime.utcnow()}}
+
+        grading_doc = await upsert_grading(
+            sheet_id=sheet_id,
+            exam_id=exam_id,
+            batch_id=batch_id,
+            result_schema_id=result_schema_id,
+            result=grading_result,
         )
-        return
 
-    response_data = result_line.get("response", result_line.get("body", {}))
-
-    grading_result = None
-    if response_data:
-        if isinstance(response_data, dict):
-            candidates = response_data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                for part in parts:
-                    if "text" in part:
-                        grading_result = _try_parse_json(part["text"])
-                        if grading_result:
-                            break
-            elif "result" in response_data:
-                grading_result = _try_parse_json(response_data["result"])
-            elif "choices" in response_data:
-                content = response_data["choices"][0].get("message", {}).get("content", "")
-                grading_result = _try_parse_json(content)
-
-    if not grading_result:
-        await batch_items_collection.update_one(
-            {"_id": item["_id"]},
-            {
-                "$set": {
-                    "status": "failed",
-                    "error": "Could not extract grading from response",
-                    "raw_response": response_data,
-                }
-            }
+        await db.execute(
+            update(AnswerSheet)
+            .where(AnswerSheet.id == sheet_id)
+            .values(status="graded", updated_at=datetime.utcnow())
         )
-        await answer_sheets_collection.update_one(
-            {"_id": sheet_id},
-            {"$set": {"status": "failed", "updated_at": datetime.utcnow()}}
-        )
-        return
+        await db.commit()
 
-    is_valid, error_msg = await validate_result_against_schema(grading_result, result_schema_id)
-    if not is_valid:
-        await batch_items_collection.update_one(
-            {"_id": item["_id"]},
-            {
-                "$set": {
-                    "status": "failed",
-                    "error": f"Schema validation failed: {error_msg}",
-                    "raw_response": response_data,
-                }
-            }
-        )
-        await answer_sheets_collection.update_one(
-            {"_id": sheet_id},
-            {"$set": {"status": "failed", "updated_at": datetime.utcnow()}}
-        )
-        return
-
-    await batch_items_collection.update_one(
-        {"_id": item["_id"]},
-        {
-            "$set": {
-                "status": "completed",
-                "raw_response": response_data,
-                "error": None,
-            }
-        }
-    )
-
-    grading_doc = await upsert_grading(
-        sheet_id=str(sheet_id),
-        exam_id=str(exam_id),
-        batch_id=str(batch_id),
-        result_schema_id=result_schema_id,
-        result=grading_result,
-    )
-
-    await answer_sheets_collection.update_one(
-        {"_id": sheet_id},
-        {"$set": {"status": "graded", "updated_at": datetime.utcnow()}}
-    )
-
-    print(f"[Poller] Graded sheet {sheet_id}: {grading_doc.get('total_awarded', 0)}/{grading_doc.get('total_max', 0)}")
+        print(f"[Poller] Graded sheet {sheet_id}: {grading_doc.get('total_awarded', 0)}/{grading_doc.get('total_max', 0)}")
 
 
-async def poll_single_batch(batch_doc: Dict[str, Any]) -> None:
-    batch_id = batch_doc["_id"]
-    provider = batch_doc.get("provider", "gemini")
-    provider_batch_id = batch_doc.get("provider_batch_id")
+async def poll_single_batch(batch_job: BatchJob) -> None:
+    batch_id = str(batch_job.id)
+    provider = batch_job.provider or "gemini"
+    provider_batch_id = batch_job.provider_batch_id
 
     if not provider_batch_id:
         return
@@ -181,109 +181,96 @@ async def poll_single_batch(batch_doc: Dict[str, Any]) -> None:
         failed_count = status_info.get("failed_count", 0)
         new_status = status_info.get("status")
 
-        update_fields = {
-            "last_polled_at": datetime.utcnow(),
-            "poll_error": status_info.get("error"),
-        }
-
-        if new_status and new_status != batch_doc.get("status"):
-            update_fields["status"] = new_status
-
-        if new_status == "completed":
-            output_path = os.path.join(
-                settings.STORAGE_PATH,
-                "batches",
-                str(batch_id),
-                "output.jsonl",
-            )
-
-            if status_info.get("output_file_name") or status_info.get("output_file_id"):
-                await batch_service.download_output(
-                    provider,
-                    provider_batch_id,
-                    output_path,
-                )
-                update_fields["output_file_path"] = output_path
-            elif new_status == "completed":
-                await batch_jobs_collection.update_one(
-                    {"_id": batch_id},
-                    {
-                        "$set": {
-                            **update_fields,
-                            "completed_count": completed_count,
-                            "failed_count": failed_count,
-                            "completed_at": datetime.utcnow(),
-                        }
-                    }
-                )
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(BatchJob).where(BatchJob.id == batch_id))
+            b_obj = res.scalar_one_or_none()
+            if not b_obj:
                 return
 
-            output_lines = jsonl_service.parse_batch_output(output_path)
+            b_obj.last_polled_at = datetime.utcnow()
+            b_obj.poll_error = status_info.get("error")
 
-            items = await batch_items_collection.find(
-                {"batch_id": batch_id}
-            ).to_list(length=None)
+            if new_status and new_status != b_obj.status:
+                b_obj.status = new_status
 
-            items_by_custom_id = {item["custom_id"]: item for item in items}
-
-            sheets = await answer_sheets_collection.find(
-                {"exam_id": batch_doc["exam_id"]}
-            ).to_list(length=None)
-
-            sheets_by_id = {str(sheet["_id"]): sheet for sheet in sheets}
-
-            exam = await exams_collection.find_one({"_id": batch_doc["exam_id"]})
-            result_schema_id = exam.get("result_schema_id") if exam else None
-
-            if result_schema_id:
-                result_schema_id = str(result_schema_id)
-
-            for line in output_lines:
-                await process_single_result(
-                    result_line=line,
-                    batch_id=batch_id,
-                    exam_id=batch_doc["exam_id"],
-                    result_schema_id=result_schema_id,
-                    items_by_custom_id=items_by_custom_id,
-                    sheets_by_id=sheets_by_id,
+            if new_status == "completed":
+                output_path = os.path.join(
+                    settings.STORAGE_PATH,
+                    "batches",
+                    batch_id,
+                    "output.jsonl",
                 )
 
-            update_fields["completed_at"] = datetime.utcnow()
+                if status_info.get("output_file_name") or status_info.get("output_file_id"):
+                    await batch_service.download_output(
+                        provider,
+                        provider_batch_id,
+                        output_path,
+                    )
+                    b_obj.output_file_path = output_path
+                elif new_status == "completed":
+                    b_obj.completed_count = completed_count
+                    b_obj.failed_count = failed_count
+                    b_obj.completed_at = datetime.utcnow()
+                    await db.commit()
+                    return
 
-        update_fields["completed_count"] = completed_count
-        update_fields["failed_count"] = failed_count
+                output_lines = jsonl_service.parse_batch_output(output_path)
 
-        await batch_jobs_collection.update_one(
-            {"_id": batch_id},
-            {"$set": update_fields}
-        )
+                bi_res = await db.execute(select(BatchItem).where(BatchItem.batch_id == batch_id))
+                items = bi_res.scalars().all()
+                items_by_custom_id = {item.custom_id: item for item in items}
+
+                sh_res = await db.execute(select(AnswerSheet).where(AnswerSheet.exam_id == b_obj.exam_id))
+                sheets = sh_res.scalars().all()
+                sheets_by_id = {str(sheet.id): sheet for sheet in sheets}
+
+                ex_res = await db.execute(select(Exam).where(Exam.id == b_obj.exam_id))
+                exam = ex_res.scalar_one_or_none()
+                result_schema_id = str(exam.result_schema_id) if (exam and exam.result_schema_id) else None
+
+                for line in output_lines:
+                    await process_single_result(
+                        result_line=line,
+                        batch_id=batch_id,
+                        exam_id=str(b_obj.exam_id),
+                        result_schema_id=result_schema_id,
+                        items_by_custom_id=items_by_custom_id,
+                        sheets_by_id=sheets_by_id,
+                    )
+
+                b_obj.completed_at = datetime.utcnow()
+
+            b_obj.completed_count = completed_count
+            b_obj.failed_count = failed_count
+            await db.commit()
 
         print(f"[Poller] Batch {batch_id}: status={new_status}, completed={completed_count}, failed={failed_count}")
 
     except Exception as e:
-        await batch_jobs_collection.update_one(
-            {"_id": batch_id},
-            {
-                "$set": {
-                    "last_polled_at": datetime.utcnow(),
-                    "poll_error": str(e),
-                }
-            }
-        )
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(BatchJob).where(BatchJob.id == batch_id))
+            b_obj = res.scalar_one_or_none()
+            if b_obj:
+                b_obj.last_polled_at = datetime.utcnow()
+                b_obj.poll_error = str(e)
+                await db.commit()
         print(f"[Poller] Error polling batch {batch_id}: {e}")
 
 
 async def run_poller():
     while True:
         try:
-            active_batches = await batch_jobs_collection.find(
-                {"status": {"$in": ["submitted", "in_progress"]}}
-            ).to_list(length=None)
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(
+                    select(BatchJob).where(BatchJob.status.in_(["submitted", "in_progress"]))
+                )
+                active_batches = res.scalars().all()
 
             if active_batches:
                 print(f"[Poller] Polling {len(active_batches)} active batches...")
-                for batch_doc in active_batches:
-                    await poll_single_batch(batch_doc)
+                for batch_job in active_batches:
+                    await poll_single_batch(batch_job)
             else:
                 print("[Poller] No active batches to poll")
 
@@ -291,10 +278,3 @@ async def run_poller():
             print(f"[Poller] Poller loop error: {e}")
 
         await asyncio.sleep(settings.BATCH_POLL_INTERVAL_SEC)
-
-
-def start_poller(app):
-    @app.on_event("startup")
-    async def startup_poller():
-        asyncio.create_task(run_poller())
-        print(f"[OK] Batch poller started (interval: {settings.BATCH_POLL_INTERVAL_SEC}s)")

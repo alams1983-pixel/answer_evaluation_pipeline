@@ -44,7 +44,6 @@ export default function AuthImage({ src, alt, className, onClick, loading }: Aut
         });
 
         if (!res.ok) {
-          console.error(`AuthImage: failed to load ${url}, status ${res.status}`);
           setError(true);
           return;
         }
@@ -56,8 +55,7 @@ export default function AuthImage({ src, alt, className, onClick, loading }: Aut
         if (!cancelled) {
           setBlobUrl(blobUrl);
         }
-      } catch (err) {
-        console.error('AuthImage: network error:', err);
+      } catch {
         setError(true);
       }
     };

@@ -94,6 +94,18 @@ export default function CsvImport({ onSuccess, onClose }: CsvImportProps) {
     }
   };
 
+  const handleDownloadSample = () => {
+    const csvContent = "email,full_name,password,class_id,roll_no\njohn.doe@school.edu,John Doe,student123,,01\njane.smith@school.edu,Jane Smith,student123,,02\n";
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', 'student_import_template.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   return (
     <div>
       {error && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
@@ -118,6 +130,19 @@ export default function CsvImport({ onSuccess, onClose }: CsvImportProps) {
         </div>
       ) : (
         <>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+              Need a starting template? You can leave <code>class_id</code> empty or use a Class Name like &quot;10-A&quot;.
+            </span>
+            <button
+              className="btn btn-secondary"
+              onClick={handleDownloadSample}
+              style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}
+            >
+              📥 Download Sample CSV
+            </button>
+          </div>
+
           <div
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
             onDragLeave={() => setDragging(false)}

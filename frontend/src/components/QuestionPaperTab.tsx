@@ -64,14 +64,17 @@ export default function QuestionPaperTab({ examId, totalMarks }: QuestionPaperTa
 
   useEffect(() => {
     loadQuestionPaper();
-  }, [loadQuestionPaper]);
+    checkExtractionStatus();
 
-  useEffect(() => {
-    if (viewMode !== 'extracting') return;
+    const isTaskActive = viewMode === 'extracting' || (extractionTask && ['queued', 'processing', 'extracting'].includes(extractionTask.status));
+    if (!isTaskActive) return;
 
     const interval = setInterval(checkExtractionStatus, 2000);
     return () => clearInterval(interval);
-  }, [viewMode, checkExtractionStatus]);
+  }, [viewMode, extractionTask, loadQuestionPaper, checkExtractionStatus]);
+
+
+
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

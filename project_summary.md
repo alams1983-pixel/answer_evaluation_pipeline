@@ -36,7 +36,7 @@ The **Evaluation Pipeline** is an end-to-end **AI-Driven Answer Sheet Evaluation
 
 ### **Backend (`/backend`)**
 * **Framework:** Python / FastAPI
-* **Database:** MongoDB (Async Motor driver) with indexing across 15+ collections
+* **Database:** MySQL (SQLAlchemy 2.0 AsyncSession with `asyncmy` driver and UUID primary keys)
 * **AI & Vision Services:** `google-genai` (Gemini 2.5 Flash/Pro), OpenAI API (Batch API support)
 * **Document Processing:** PyMuPDF (`fitz`), Pillow (PIL)
 * **Auth & Security:** JWT authentication (`PyJWT`), Passlib bcrypt hashing, Role-Based Access Control (`admin`, `teacher`, `student`)
